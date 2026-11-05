@@ -1,0 +1,70 @@
+name: Build, Test y Release
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: audit
+          POSTGRES_PASSWORD: audit
+          POSTGRES_DB: audit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U audit -d audit"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3.13-alpine
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://audit:audit@localhost:5432/audit?sslmode=disable
+      TEST_RABBITMQ_URL: amqp://guest:guest@localhost:5672/
+    steps:
+      - name: Descargar código fuente
+        uses: actions/checkout@v4
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Descargar dependencias
+        run: go mod download
+
+      - name: Compilar
+        run: |
+          CGO_ENABLED=0 go build -o audit ./cmd/api
+          CGO_ENABLED=0 go build -o auditctl ./cmd/auditctl
+          CGO_ENABLED=0 go build -o audit-keygen ./cmd/audit-keygen
+          CGO_ENABLED=0 go build -o audit-open ./cmd/audit-open
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Pruebas unitarias
+        run: go test -race ./... -v
+
+      - name: Pruebas de integración (PostgreSQL y RabbitMQ)
+        run: go test -race -tags integration ./... -v
+
+      - name: Escaneo de vulnerabilidades de dependencias
+        # Reporta; no actualiza dependencias (eso solo ocurre por pedido explícito).
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

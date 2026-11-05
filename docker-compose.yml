@@ -1,0 +1,83 @@
+services:
+  vinculo-vial-audit:
+    container_name: vinculo-vial-audit
+    # Mayor que el apagado ordenado (el mensaje en curso de cada consumidor y la
+    # vuelta en curso del sweeper se esperan hasta 20 s): si no, SIGKILL llega antes.
+    stop_grace_period: 40s
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Deliberadamente sin `ports:`. Audit no tiene superficie pública: /health y
+    # /ready viven en un puerto que no se publica. Los chequea el orquestador
+    # dentro de la red.
+    environment:
+      PORT: ${PORT:-8080}
+      DATABASE_URL: postgres://audit:audit@vinculo-vial-audit-db:5432/audit?sslmode=disable
+      DB_QUERY_TIMEOUT_MS: ${DB_QUERY_TIMEOUT_MS:-1500}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://guest:guest@vinculo-vial-rabbitmq:5672/}
+      RABBITMQ_PUBLISH_TIMEOUT_MS: ${RABBITMQ_PUBLISH_TIMEOUT_MS:-2000}
+      RABBITMQ_PREFETCH: ${RABBITMQ_PREFETCH:-10}
+      MAX_RETRIES: ${MAX_RETRIES:-10}
+      AUDIT_RECORDED_QUEUE: ${AUDIT_RECORDED_QUEUE:-audit.alert-recorded.q}
+      AUDIT_DELIVERED_QUEUE: ${AUDIT_DELIVERED_QUEUE:-audit.alert-delivered.q}
+      AUDIT_DISCARDED_QUEUE: ${AUDIT_DISCARDED_QUEUE:-audit.alert-discarded.q}
+      # Retención y modo de bloqueo: decisiones legales, sin valor por defecto.
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:?la variable AUDIT_RETENTION_DAYS es obligatoria en .env}
+      AUDIT_OBJECT_LOCK_MODE: ${AUDIT_OBJECT_LOCK_MODE:?la variable AUDIT_OBJECT_LOCK_MODE es obligatoria en .env}
+      AUDIT_BUCKET: ${AUDIT_BUCKET:?la variable AUDIT_BUCKET es obligatoria en .env}
+      EVIDENCE_BUCKET: ${EVIDENCE_BUCKET:?la variable EVIDENCE_BUCKET es obligatoria en .env}
+      S3_REGION: ${S3_REGION:?la variable S3_REGION es obligatoria en .env}
+      S3_PUT_TIMEOUT_MS: ${S3_PUT_TIMEOUT_MS:-5000}
+      S3_GET_TIMEOUT_MS: ${S3_GET_TIMEOUT_MS:-5000}
+      S3_MAX_OBJECT_BYTES: ${S3_MAX_OBJECT_BYTES:-20971520}
+      S3_BREAKER_FAILURE_THRESHOLD: ${S3_BREAKER_FAILURE_THRESHOLD:-5}
+      S3_BREAKER_WINDOW_MS: ${S3_BREAKER_WINDOW_MS:-30000}
+      S3_BREAKER_OPEN_DURATION_MS: ${S3_BREAKER_OPEN_DURATION_MS:-30000}
+      AUDIT_SWEEP_INTERVAL: ${AUDIT_SWEEP_INTERVAL:-1h}
+      AUDIT_SWEEP_BATCH_SIZE: ${AUDIT_SWEEP_BATCH_SIZE:-500}
+      # Credenciales de AWS: cadena estándar del SDK. En local vienen de .env; en
+      # producción, del rol IAM. Audit nunca recibe la clave privada de Audit ni las
+      # claves AES de otros servicios: si se definieran, el servicio no arranca.
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+    networks:
+      - vinculo-vial
+      - audit-internal
+    depends_on:
+      vinculo-vial-audit-db:
+        condition: service_healthy
+
+  vinculo-vial-audit-db:
+    container_name: vinculo-vial-audit-db
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: audit
+      POSTGRES_PASSWORD: audit
+      POSTGRES_DB: audit
+    volumes:
+      - vinculo-vial-audit-data:/var/lib/postgresql/data
+    networks:
+      - audit-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U audit -d audit"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  # Nombre fijado explícitamente: sin `name`, Compose antepone el nombre del
+  # proyecto (el propio directorio) y duplicaría el prefijo vinculo-vial-audit.
+  vinculo-vial-audit-data:
+    name: vinculo-vial-audit-data
+
+networks:
+  # Red puente compartida por toda la plataforma. Es externa: la crea el
+  # ecosistema (o el operador con `docker network create vinculo-vial`). Solo el
+  # servicio se conecta acá, para alcanzar el broker.
+  vinculo-vial:
+    external: true
+  # Red local exclusiva de este servicio: aísla el tráfico hacia su base de datos,
+  # que no debe ser alcanzable desde otros microservicios ni desde la red compartida.
+  audit-internal:
+    name: audit-internal
