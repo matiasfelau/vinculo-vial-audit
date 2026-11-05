@@ -45,9 +45,22 @@ type Sweeper struct {
 	now       func() time.Time
 }
 
+// Option configura aspectos opcionales del Sweeper.
+type Option func(*Sweeper)
+
+// WithClock reemplaza el reloj. Permite simular el paso del tiempo en las pruebas
+// sin esperarlo.
+func WithClock(now func() time.Time) Option {
+	return func(s *Sweeper) { s.now = now }
+}
+
 // New construye el sweeper. batchSize acota cuántos registros se leen por página.
-func New(store expiredStore, purger objectPurger, batchSize int) *Sweeper {
-	return &Sweeper{store: store, purger: purger, batchSize: batchSize, now: func() time.Time { return time.Now().UTC() }}
+func New(store expiredStore, purger objectPurger, batchSize int, opts ...Option) *Sweeper {
+	s := &Sweeper{store: store, purger: purger, batchSize: batchSize, now: func() time.Time { return time.Now().UTC() }}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // RunOnce ejecuta una vuelta completa. Recorre los registros vencidos por páginas

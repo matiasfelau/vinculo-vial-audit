@@ -14,6 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gin-gonic/gin"
+
 	"github.com/matiasfelau/vinculo-vial-audit/internal/client/storage"
 	"github.com/matiasfelau/vinculo-vial-audit/internal/delivery/events"
 	httpdelivery "github.com/matiasfelau/vinculo-vial-audit/internal/delivery/http"
@@ -52,6 +54,9 @@ func main() {
 }
 
 func run() error {
+	// Sin modo de depuración: ni trazas de rutas ni detalles internos en la salida.
+	gin.SetMode(gin.ReleaseMode)
+
 	cfg, err := config.Load()
 	if err != nil {
 		return err

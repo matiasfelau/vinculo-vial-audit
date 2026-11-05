@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -410,5 +411,49 @@ func TestSetLegalHoldOffQuitaElHold(t *testing.T) {
 
 	if api.holdIn[0].LegalHold.Status != types.ObjectLockLegalHoldStatusOff {
 		t.Errorf("estado = %s, esperaba OFF", api.holdIn[0].LegalHold.Status)
+	}
+}
+
+// captureLogs redirige slog a un buffer durante la prueba.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return &buf
+}
+
+func TestLasTransicionesDelCircuitoSeRegistran(t *testing.T) {
+	logs := captureLogs(t)
+	api := &fakeS3{putErr: httpError(http.StatusServiceUnavailable, "SlowDown")}
+	store := newStore(api, testConfig())
+
+	for i := 0; i < 2; i++ {
+		_ = store.PutLocked(context.Background(), "k", []byte("x"), "t", time.Now())
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, "transición del circuito") || !strings.Contains(out, "hacia=open") || !strings.Contains(out, "desde=closed") {
+		t.Errorf("la apertura del circuito debía registrarse: %s", out)
+	}
+	if !strings.Contains(out, "bucket=vinculo-vial-audit-test") {
+		t.Errorf("el log debía identificar el bucket: %s", out)
+	}
+}
+
+func TestLosErroresYLogsNoReproducenLaClaveDelObjeto(t *testing.T) {
+	logs := captureLogs(t)
+	const key = "records/0b8a6c5e-1f56-4e0b-9d63-4f6b8f0f2c11/manifest.json"
+	// El texto de un error de red del SDK incluye la URL con la clave del objeto.
+	api := &fakeS3{getErr: errors.New(`Get "https://bucket.s3.amazonaws.com/` + key + `?x-id=GetObject": dial tcp: connection refused`)}
+
+	_, err := newStore(api, testConfig()).Get(context.Background(), key)
+
+	if !errors.Is(err, domain.ErrStorageUnavailable) {
+		t.Fatalf("esperaba ErrStorageUnavailable, obtuvo %v", err)
+	}
+	if strings.Contains(err.Error(), key) || strings.Contains(logs.String(), key) {
+		t.Errorf("la clave del objeto no debe aparecer en el error ni en los logs (error: %v, logs: %s)", err, logs.String())
 	}
 }

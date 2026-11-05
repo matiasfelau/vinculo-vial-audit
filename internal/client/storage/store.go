@@ -301,10 +301,13 @@ func (s *Store) do(ctx context.Context, op string, timeout time.Duration, call f
 
 // guard envuelve la llamada con el circuit breaker, clasifica el error y
 // registra el resultado. Con el circuito abierto falla de inmediato, sin llamar
-// a S3.
+// a S3. Cada transición del circuito se registra.
 func (s *Store) guard(op string, call func() error) error {
+	before := s.breaker.State()
+	defer s.logTransition(before)
+
 	if !s.breaker.Allow() {
-		slog.Warn("storage: circuito de S3 abierto, no se llama a S3", "op", op)
+		slog.Warn("storage: circuito de S3 abierto, no se llama a S3", "bucket", s.cfg.Bucket, "op", op)
 		return domain.ErrStorageUnavailable
 	}
 
@@ -327,10 +330,23 @@ func (s *Store) guard(op string, call func() error) error {
 		}
 	default:
 		s.breaker.RecordFailure()
-		slog.Error("storage: falla de S3", "op", op, "circuit", s.breaker.State())
+		slog.Error("storage: falla de S3", "bucket", s.cfg.Bucket, "op", op, "causa", classified.Error())
 	}
 
 	return classified
+}
+
+// logTransition registra el cambio de estado del circuito respecto de before.
+func (s *Store) logTransition(before string) {
+	after := s.breaker.State()
+	if after == before {
+		return
+	}
+	if after == stateOpen {
+		slog.Warn("storage: transición del circuito de S3", "bucket", s.cfg.Bucket, "desde", before, "hacia", after)
+		return
+	}
+	slog.Info("storage: transición del circuito de S3", "bucket", s.cfg.Bucket, "desde", before, "hacia", after)
 }
 
 // classify traduce un error del SDK al error de dominio correspondiente:
@@ -353,14 +369,14 @@ func classify(err error) error {
 
 	var noSuchKey *types.NoSuchKey
 	if errors.As(err, &noSuchKey) {
-		return fmt.Errorf("%w: %v", domain.ErrObjectNotFound, err)
+		return fmt.Errorf("%w: %s", domain.ErrObjectNotFound, describe(err))
 	}
 
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
 		case codeNoSuchKey, codeNotFound:
-			return fmt.Errorf("%w: %v", domain.ErrObjectNotFound, err)
+			return fmt.Errorf("%w: %s", domain.ErrObjectNotFound, describe(err))
 		}
 	}
 
@@ -369,11 +385,11 @@ func classify(err error) error {
 		status := respErr.HTTPStatusCode()
 		switch {
 		case status == http.StatusNotFound:
-			return fmt.Errorf("%w: %v", domain.ErrObjectNotFound, err)
+			return fmt.Errorf("%w: %s", domain.ErrObjectNotFound, describe(err))
 		case status >= http.StatusInternalServerError, status == http.StatusTooManyRequests:
-			return fmt.Errorf("%w: %v", domain.ErrStorageUnavailable, err)
+			return fmt.Errorf("%w: %s", domain.ErrStorageUnavailable, describe(err))
 		default:
-			return fmt.Errorf("%w: %v", domain.ErrStorageRejected, err)
+			return fmt.Errorf("%w: %s", domain.ErrStorageRejected, describe(err))
 		}
 	}
 
@@ -383,5 +399,24 @@ func classify(err error) error {
 
 	// Sin respuesta HTTP: timeout (context.DeadlineExceeded incluido), DNS,
 	// conexión rechazada, TLS o corte a mitad de camino.
-	return fmt.Errorf("%w: %v", domain.ErrStorageUnavailable, err)
+	return fmt.Errorf("%w: %s", domain.ErrStorageUnavailable, describe(err))
+}
+
+// describe resume un error del SDK sin reproducir su texto: el mensaje de un error
+// de red incluye la URL del objeto (con la clave), que no debe llegar a logs ni a
+// errores. Devuelve el código HTTP y el código de error de S3, o la clase de falla.
+func describe(err error) string {
+	var respErr *smithyhttp.ResponseError
+	if errors.As(err, &respErr) {
+		description := fmt.Sprintf("HTTP %d", respErr.HTTPStatusCode())
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) {
+			description += " " + apiErr.ErrorCode()
+		}
+		return description
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "error de red"
 }
