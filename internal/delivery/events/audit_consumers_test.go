@@ -514,3 +514,57 @@ func TestEnvelopeIlegibleVaALaDLQ(t *testing.T) {
 
 	assertDLQ(t, h.recorded.Handle(context.Background(), []byte("no es json"), 0), h.recordedDLQ)
 }
+
+func TestRecordedSobreAlertaDescartadaHaceAckSinCrearElRegistro(t *testing.T) {
+	h := newHarness()
+	id := uuid.New()
+	h.record(t, id)
+	if outcome := h.discarded.Handle(context.Background(), envelopeBody(t, "audit.alert.discarded", map[string]any{"alert_id": id.String(), "reason": "REJECTED"}), 0); outcome != OutcomeAck {
+		t.Fatalf("descarte: %v", outcome)
+	}
+
+	outcome := h.recorded.Handle(context.Background(), envelopeBody(t, "audit.alert.recorded", recordedPayloadFor(id)), 0)
+
+	if outcome != OutcomeAck {
+		t.Fatalf("outcome = %v, esperaba ack", outcome)
+	}
+	if _, ok := h.store.Lookup(id); ok {
+		t.Error("un recorded duplicado tras el descarte no debe recrear el registro")
+	}
+	if len(h.recordedDLQ.published) != 0 {
+		t.Error("no va a la DLQ")
+	}
+}
+
+func TestDiscardedDuplicadoTrasElBorradoHaceAckSinDLQ(t *testing.T) {
+	h := newHarness()
+	id := uuid.New()
+	h.record(t, id)
+	body := envelopeBody(t, "audit.alert.discarded", map[string]any{"alert_id": id.String(), "reason": "EXPIRED"})
+	if outcome := h.discarded.Handle(context.Background(), body, 0); outcome != OutcomeAck {
+		t.Fatalf("primer descarte: %v", outcome)
+	}
+
+	outcome := h.discarded.Handle(context.Background(), body, 0)
+
+	if outcome != OutcomeAck || len(h.discardedDLQ.published) != 0 {
+		t.Errorf("la reentrega debe hacer ack sin DLQ (outcome=%v, DLQ=%d)", outcome, len(h.discardedDLQ.published))
+	}
+}
+
+func TestDeliveredSobreAlertaDescartadaVaALaDLQSinReintento(t *testing.T) {
+	h := newHarness()
+	id := uuid.New()
+	h.record(t, id)
+	if outcome := h.discarded.Handle(context.Background(), envelopeBody(t, "audit.alert.discarded", map[string]any{"alert_id": id.String(), "reason": "UNCLAIMED"}), 0); outcome != OutcomeAck {
+		t.Fatalf("descarte: %v", outcome)
+	}
+	puts := h.audit.PutCalls
+
+	outcome := h.delivered.Handle(context.Background(), envelopeBody(t, "audit.alert.delivered", h.deliveredPayloadFor(id)), 0)
+
+	assertDLQ(t, outcome, h.deliveredDLQ)
+	if h.audit.PutCalls != puts {
+		t.Error("no debe subir nada")
+	}
+}

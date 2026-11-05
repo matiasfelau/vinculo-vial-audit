@@ -39,4 +39,9 @@ var (
 	// ErrRetentionElapsed indica que destroy_at ya pasó: S3 no admite una retención
 	// en el pasado. Es permanente.
 	ErrRetentionElapsed = errors.New("domain: la fecha de destrucción del registro ya venció")
+
+	// ErrAlertDiscarded indica que la alerta ya fue descartada (existe su tombstone) y
+	// llegó un evento que presupone un registro vivo, como delivered. Es una
+	// inconsistencia de Alert: permanente.
+	ErrAlertDiscarded = errors.New("domain: la alerta ya fue descartada")
 )

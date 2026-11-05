@@ -101,6 +101,21 @@ func TestRecordRepetidoNoCambiaNada(t *testing.T) {
 	}
 }
 
+func TestRecordConTombstoneHaceAckSinInsertar(t *testing.T) {
+	store := testsupport.NewMemoryStore()
+	id := uuid.New()
+	store.AddTombstone(id, fixedNow)
+
+	err := newRecorder(store).Record(context.Background(), recordedInput(id))
+
+	if err != nil {
+		t.Fatalf("un recorded sobre una alerta descartada debe hacer ack: %v", err)
+	}
+	if _, ok := store.Lookup(id); ok {
+		t.Error("no debe recrear un registro con DNI que nadie borraría hasta su vencimiento")
+	}
+}
+
 func TestRecordConBaseCaidaEsTransitorio(t *testing.T) {
 	store := testsupport.NewMemoryStore()
 	store.ErrInsert = domain.ErrRepositoryUnavailable
@@ -386,6 +401,25 @@ func TestDeliverConDestroyAtVencidoEsPermanente(t *testing.T) {
 	}
 }
 
+func TestDeliverSinRegistroPeroConTombstoneEsPermanente(t *testing.T) {
+	f := newDeliveryFixture(t)
+	in := f.input()
+	in.AlertID = uuid.New()
+	f.store.AddTombstone(in.AlertID, fixedNow)
+
+	err := f.deliver.Deliver(context.Background(), in)
+
+	if !errors.Is(err, domain.ErrAlertDiscarded) {
+		t.Fatalf("esperaba ErrAlertDiscarded (inconsistencia de Alert), obtuvo %v", err)
+	}
+	if errors.Is(err, domain.ErrRecordNotFound) {
+		t.Error("no debe tratarse como transitorio")
+	}
+	if f.audit.PutCalls != 0 || f.evidence.GetCalls != 0 {
+		t.Error("no debe tocar S3")
+	}
+}
+
 // --- Discarder ---
 
 func TestDiscardBorraUnRegistroRecorded(t *testing.T) {
@@ -402,6 +436,69 @@ func TestDiscardBorraUnRegistroRecorded(t *testing.T) {
 	if _, ok := store.Lookup(id); ok {
 		t.Error("el registro RECORDED debía borrarse")
 	}
+	if tombstoned, _ := store.HasTombstone(context.Background(), id); !tombstoned {
+		t.Error("el descarte debe dejar su tombstone")
+	}
+}
+
+func TestDiscardSinRegistroPeroConTombstoneHaceAck(t *testing.T) {
+	store := testsupport.NewMemoryStore()
+	id := uuid.New()
+	store.AddTombstone(id, fixedNow)
+
+	err := NewDiscarder(store).Discard(context.Background(), id, domain.DiscardReasonRejected)
+
+	if err != nil {
+		t.Fatalf("un discarded duplicado debe hacer ack: %v", err)
+	}
+}
+
+func TestDiscardDuplicadoTrasElBorradoHaceAck(t *testing.T) {
+	store := testsupport.NewMemoryStore()
+	id := uuid.New()
+	if err := newRecorder(store).Record(context.Background(), recordedInput(id)); err != nil {
+		t.Fatal(err)
+	}
+	discarder := NewDiscarder(store)
+	if err := discarder.Discard(context.Background(), id, domain.DiscardReasonRejected); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := discarder.Discard(context.Background(), id, domain.DiscardReasonRejected); err != nil {
+		t.Fatalf("la reentrega del mismo discarded debe hacer ack: %v", err)
+	}
+}
+
+func TestDiscardNoCreaTombstoneSiElBorradoFalla(t *testing.T) {
+	store := testsupport.NewMemoryStore()
+	id := uuid.New()
+	if err := newRecorder(store).Record(context.Background(), recordedInput(id)); err != nil {
+		t.Fatal(err)
+	}
+	store.ErrDelete = domain.ErrRepositoryUnavailable
+
+	err := NewDiscarder(store).Discard(context.Background(), id, domain.DiscardReasonRejected)
+
+	if !errors.Is(err, domain.ErrRepositoryUnavailable) {
+		t.Fatalf("esperaba ErrRepositoryUnavailable, obtuvo %v", err)
+	}
+	if store.TombstoneCount() != 0 {
+		t.Error("borrado y tombstone van juntos: sin borrado no hay tombstone")
+	}
+}
+
+func TestDiscardSobreRegistroEntregadoNoCreaTombstone(t *testing.T) {
+	store := testsupport.NewMemoryStore()
+	id := uuid.New()
+	store.Put(domain.Record{AlertID: id, Status: domain.StatusDelivered, DestroyAt: fixedNow.Add(time.Hour)})
+
+	if err := NewDiscarder(store).Discard(context.Background(), id, domain.DiscardReasonUnclaimed); err != nil {
+		t.Fatal(err)
+	}
+
+	if store.TombstoneCount() != 0 {
+		t.Error("un registro entregado no se descarta: tampoco debe quedar tombstone")
+	}
 }
 
 func TestDiscardSinRegistroEsTransitorio(t *testing.T) {
@@ -411,6 +508,9 @@ func TestDiscardSinRegistroEsTransitorio(t *testing.T) {
 
 	if !errors.Is(err, domain.ErrRecordNotFound) {
 		t.Fatalf("esperaba ErrRecordNotFound (orden invertido), obtuvo %v", err)
+	}
+	if store.TombstoneCount() != 0 {
+		t.Error("un discarded sin registro no debe crear un tombstone")
 	}
 }
 

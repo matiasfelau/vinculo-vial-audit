@@ -21,7 +21,10 @@ import (
 // Sweeper contra PostgreSQL real y un reloj simulado: el tiempo avanza sin esperar.
 // Los objetos viven en un bucket en memoria que respeta la retención con el mismo reloj.
 
-const integrationRetention = 24 * time.Hour
+const (
+	integrationRetention          = 24 * time.Hour
+	integrationTombstoneRetention = 7 * 24 * time.Hour
+)
 
 var integrationBase = time.Date(2026, 11, 4, 10, 0, 0, 0, time.UTC)
 
@@ -44,7 +47,7 @@ func newSimulation(t *testing.T) *simulation {
 }
 
 func (s *simulation) sweeper(batch int) *sweeper.Sweeper {
-	return sweeper.New(s.repo, s.objects, batch, sweeper.WithClock(func() time.Time { return s.now }))
+	return sweeper.New(s.repo, s.objects, batch, integrationTombstoneRetention, sweeper.WithClock(func() time.Time { return s.now }))
 }
 
 // add crea un registro de la alerta creada en integrationBase, con sus objetos
@@ -58,8 +61,8 @@ func (s *simulation) add(t *testing.T, delivered bool) uuid.UUID {
 		DNIEncAudit: "ZG5p", PatEncAudit: "cGF0", AuditKeyID: "2026-11",
 		Status: domain.StatusRecorded, RecordedAt: integrationBase, DestroyAt: integrationBase.Add(integrationRetention),
 	}
-	if inserted, err := s.repo.Insert(context.Background(), record); err != nil || !inserted {
-		t.Fatalf("insert: %v, %v", inserted, err)
+	if result, err := s.repo.Insert(context.Background(), record); err != nil || result != domain.InsertCreated {
+		t.Fatalf("insert: %v, %v", result, err)
 	}
 	if !delivered {
 		return id
@@ -190,5 +193,31 @@ func TestSweeperReintentaCuandoS3TodaviaRetiene(t *testing.T) {
 	result, err = sim.sweeper(10).RunOnce(context.Background())
 	if err != nil || result.Destroyed != 1 || sim.exists(t, id) {
 		t.Fatalf("la vuelta siguiente debía destruirlo: %+v, %v", result, err)
+	}
+}
+
+func TestSweeperDepuraTombstonesConRelojSimulado(t *testing.T) {
+	sim := newSimulation(t)
+	id := sim.add(t, false)
+	if discarded, err := sim.repo.DiscardRecorded(context.Background(), id, integrationBase); err != nil || !discarded {
+		t.Fatalf("descarte: %v, %v", discarded, err)
+	}
+
+	sim.now = integrationBase.Add(integrationTombstoneRetention)
+	result, err := sim.sweeper(10).RunOnce(context.Background())
+	if err != nil || result.TombstonesDeleted != 0 {
+		t.Fatalf("en el límite el tombstone se conserva: %+v, %v", result, err)
+	}
+	if tombstoned, _ := sim.repo.HasTombstone(context.Background(), id); !tombstoned {
+		t.Fatal("el tombstone debía conservarse")
+	}
+
+	sim.now = integrationBase.Add(integrationTombstoneRetention + time.Second)
+	result, err = sim.sweeper(10).RunOnce(context.Background())
+	if err != nil || result.TombstonesDeleted != 1 {
+		t.Fatalf("pasada la retención el tombstone se depura: %+v, %v", result, err)
+	}
+	if tombstoned, _ := sim.repo.HasTombstone(context.Background(), id); tombstoned {
+		t.Error("el tombstone debía depurarse")
 	}
 }

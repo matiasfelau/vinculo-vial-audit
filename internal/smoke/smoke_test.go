@@ -224,6 +224,15 @@ func TestSmokeRecordedDeliveredYDiscarded(t *testing.T) {
 	e.publish(t, "audit.alert.discarded", map[string]any{"alert_id": discardedID.String(), "reason": "REJECTED"})
 	waitFor(t, "registro descartado borrado", func() bool { _, ok := e.statusOf(discardedID); return !ok })
 
+	// Duplicados posteriores al descarte (entrega al menos una vez): el tombstone evita
+	// que un recorded recree el registro y que un discarded termine en la DLQ.
+	e.publish(t, "audit.alert.discarded", map[string]any{"alert_id": discardedID.String(), "reason": "REJECTED"})
+	e.publish(t, "audit.alert.recorded", e.recordedPayload(discardedID))
+	time.Sleep(5 * time.Second)
+	if _, ok := e.statusOf(discardedID); ok {
+		t.Error("un recorded duplicado tras el descarte no debe recrear el registro")
+	}
+
 	// El registro entregado no se ve afectado por un discarded.
 	e.publish(t, "audit.alert.discarded", map[string]any{"alert_id": alertID.String(), "reason": "UNCLAIMED"})
 	time.Sleep(5 * time.Second)

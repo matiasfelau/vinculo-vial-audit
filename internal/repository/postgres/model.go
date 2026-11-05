@@ -33,6 +33,15 @@ type auditRecordModel struct {
 // TableName fija el nombre de la tabla.
 func (auditRecordModel) TableName() string { return "audit_records" }
 
+// discardedAlertModel es el tombstone de una alerta descartada: sin datos personales.
+type discardedAlertModel struct {
+	AlertID     uuid.UUID `gorm:"column:alert_id;type:uuid;primaryKey"`
+	DiscardedAt time.Time `gorm:"column:discarded_at"`
+}
+
+// TableName fija el nombre de la tabla.
+func (discardedAlertModel) TableName() string { return "discarded_alerts" }
+
 func toModel(r domain.Record) (auditRecordModel, error) {
 	evidence, err := encodeEvidence(r.Evidence)
 	if err != nil {

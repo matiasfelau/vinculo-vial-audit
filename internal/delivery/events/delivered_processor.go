@@ -61,7 +61,7 @@ func NewDeliveredProcessor(deliverer alertDeliverer, evidenceBucket string) *Del
 }
 
 // Process implementa Processor. Los errores permanentes del caso de uso
-// (integridad, retención vencida) se traducen a ErrInvalidMessage para que el
+// (integridad, retención vencida, alerta ya descartada) se traducen a ErrInvalidMessage para que el
 // mensaje vaya directo a la DLQ; el resto es transitorio.
 func (p *DeliveredProcessor) Process(ctx context.Context, envelope InboundEnvelope) error {
 	input, err := p.parseDelivered(envelope)
@@ -77,6 +77,8 @@ func (p *DeliveredProcessor) Process(ctx context.Context, envelope InboundEnvelo
 		return invalid("el contenido de una foto no coincide con su SHA-256")
 	case errors.Is(err, domain.ErrRetentionElapsed):
 		return invalid("la fecha de destrucción del registro ya venció")
+	case errors.Is(err, domain.ErrAlertDiscarded):
+		return invalid("delivered sobre una alerta ya descartada")
 	default:
 		return fmt.Errorf("audit.alert.delivered: %w", err)
 	}

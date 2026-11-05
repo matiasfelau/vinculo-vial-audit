@@ -93,24 +93,43 @@ func (r *AuditRepository) Ping(ctx context.Context) error {
 	return classifyError(sqlDB.PingContext(ctx))
 }
 
-// Insert crea el registro y devuelve true. Si ya existe uno con el mismo
-// alert_id no cambia nada y devuelve false (ON CONFLICT DO NOTHING).
-func (r *AuditRepository) Insert(ctx context.Context, record domain.Record) (bool, error) {
+// Insert crea el registro en una transacción. Si la alerta ya fue descartada
+// (existe su tombstone) no inserta nada y devuelve InsertTombstoned. Si ya existe
+// un registro con el mismo alert_id no cambia nada (ON CONFLICT DO NOTHING) y
+// devuelve InsertExisting.
+func (r *AuditRepository) Insert(ctx context.Context, record domain.Record) (domain.InsertResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.queryTimeout)
 	defer cancel()
 
 	model, err := toModel(record)
 	if err != nil {
-		return false, err
+		return domain.InsertCreated, err
 	}
 
-	result := r.db.WithContext(ctx).
-		Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "alert_id"}}, DoNothing: true}).
-		Create(&model)
-	if result.Error != nil {
-		return false, classifyError(result.Error)
+	result := domain.InsertCreated
+	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var tombstones int64
+		if err := tx.Model(&discardedAlertModel{}).Where("alert_id = ?", record.AlertID).Count(&tombstones).Error; err != nil {
+			return err
+		}
+		if tombstones > 0 {
+			result = domain.InsertTombstoned
+			return nil
+		}
+
+		insert := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "alert_id"}}, DoNothing: true}).Create(&model)
+		if insert.Error != nil {
+			return insert.Error
+		}
+		if insert.RowsAffected != 1 {
+			result = domain.InsertExisting
+		}
+		return nil
+	})
+	if err != nil {
+		return domain.InsertCreated, classifyError(err)
 	}
-	return result.RowsAffected == 1, nil
+	return result, nil
 }
 
 // Get devuelve el registro, o domain.ErrRecordNotFound si no existe.
@@ -161,20 +180,63 @@ func (r *AuditRepository) MarkDelivered(ctx context.Context, alertID uuid.UUID, 
 	return updated, nil
 }
 
-// DeleteRecorded borra el registro solo si sigue RECORDED: un registro
-// entregado nunca se borra antes de su vencimiento. Devuelve si borró.
-func (r *AuditRepository) DeleteRecorded(ctx context.Context, alertID uuid.UUID) (bool, error) {
+// DiscardRecorded borra el registro solo si sigue RECORDED e inserta el tombstone
+// de la alerta, en la misma transacción: o ocurren las dos cosas o ninguna. Un
+// registro entregado nunca se borra antes de su vencimiento. Devuelve si borró.
+func (r *AuditRepository) DiscardRecorded(ctx context.Context, alertID uuid.UUID, discardedAt time.Time) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.queryTimeout)
 	defer cancel()
 
-	var deleted bool
+	var discarded bool
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		result := tx.Where("alert_id = ? AND status = ?", alertID, string(domain.StatusRecorded)).Delete(&auditRecordModel{})
-		deleted = result.RowsAffected == 1
-		return result.Error
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return nil
+		}
+
+		tombstone := discardedAlertModel{AlertID: alertID, DiscardedAt: discardedAt}
+		insert := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "alert_id"}}, DoNothing: true}).Create(&tombstone)
+		if insert.Error != nil {
+			return insert.Error
+		}
+		discarded = true
+		return nil
 	})
 	if err != nil {
 		return false, classifyError(err)
+	}
+	return discarded, nil
+}
+
+// HasTombstone indica si la alerta fue descartada.
+func (r *AuditRepository) HasTombstone(ctx context.Context, alertID uuid.UUID) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.queryTimeout)
+	defer cancel()
+
+	var count int64
+	if err := r.db.WithContext(ctx).Model(&discardedAlertModel{}).Where("alert_id = ?", alertID).Count(&count).Error; err != nil {
+		return false, classifyError(err)
+	}
+	return count > 0, nil
+}
+
+// DeleteTombstonesBefore borra los tombstones descartados antes de cutoff y
+// devuelve cuántos borró.
+func (r *AuditRepository) DeleteTombstonesBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.queryTimeout)
+	defer cancel()
+
+	var deleted int64
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Where("discarded_at < ?", cutoff).Delete(&discardedAlertModel{})
+		deleted = result.RowsAffected
+		return result.Error
+	})
+	if err != nil {
+		return 0, classifyError(err)
 	}
 	return deleted, nil
 }

@@ -16,6 +16,7 @@ func requiredEnv() map[string]string {
 		"S3_REGION":              "us-east-1",
 		"AUDIT_RETENTION_DAYS":   "1095",
 		"AUDIT_OBJECT_LOCK_MODE": "GOVERNANCE",
+		"AUDIT_TOMBSTONE_DAYS":   "7",
 	}
 }
 
@@ -63,6 +64,9 @@ func TestLoadConValoresPorDefectoDelContrato(t *testing.T) {
 	if cfg.RecordedQueue != "audit.alert-recorded.q" || cfg.DeliveredQueue != "audit.alert-delivered.q" || cfg.DiscardedQueue != "audit.alert-discarded.q" {
 		t.Errorf("colas = %q %q %q", cfg.RecordedQueue, cfg.DeliveredQueue, cfg.DiscardedQueue)
 	}
+	if cfg.TombstoneDays != 7 {
+		t.Errorf("TombstoneDays = %d", cfg.TombstoneDays)
+	}
 	if cfg.RabbitMQPrefetch != 10 {
 		t.Errorf("RabbitMQPrefetch = %d", cfg.RabbitMQPrefetch)
 	}
@@ -92,6 +96,10 @@ func TestLoadConValoresInvalidosFalla(t *testing.T) {
 	casos := map[string]map[string]string{
 		"retención cero":                  {"AUDIT_RETENTION_DAYS": "0"},
 		"retención negativa":              {"AUDIT_RETENTION_DAYS": "-5"},
+		"tombstone cero":                  {"AUDIT_TOMBSTONE_DAYS": "0"},
+		"tombstone negativo":              {"AUDIT_TOMBSTONE_DAYS": "-1"},
+		"tombstone no numérico":           {"AUDIT_TOMBSTONE_DAYS": "una semana"},
+		"tombstone desmedido":             {"AUDIT_TOMBSTONE_DAYS": "99999"},
 		"retención no numérica":           {"AUDIT_RETENTION_DAYS": "tres años"},
 		"retención desmedida":             {"AUDIT_RETENTION_DAYS": "999999"},
 		"modo de bloqueo desconocido":     {"AUDIT_OBJECT_LOCK_MODE": "PERMISSIVE"},
@@ -149,7 +157,7 @@ func TestForbiddenSecretIgnoraVariablesVaciasYNoRelacionadas(t *testing.T) {
 }
 
 func TestLoadCLINoExigeBrokerNiBucketDeEvidencia(t *testing.T) {
-	setEnv(t, map[string]string{"RABBITMQ_URL": "", "EVIDENCE_BUCKET": "", "AUDIT_RETENTION_DAYS": ""})
+	setEnv(t, map[string]string{"RABBITMQ_URL": "", "EVIDENCE_BUCKET": "", "AUDIT_RETENTION_DAYS": "", "AUDIT_TOMBSTONE_DAYS": ""})
 
 	cfg, err := LoadCLI()
 

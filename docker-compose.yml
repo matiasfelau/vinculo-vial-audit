@@ -35,6 +35,7 @@ services:
       S3_BREAKER_OPEN_DURATION_MS: ${S3_BREAKER_OPEN_DURATION_MS:-30000}
       AUDIT_SWEEP_INTERVAL: ${AUDIT_SWEEP_INTERVAL:-1h}
       AUDIT_SWEEP_BATCH_SIZE: ${AUDIT_SWEEP_BATCH_SIZE:-500}
+      AUDIT_TOMBSTONE_DAYS: ${AUDIT_TOMBSTONE_DAYS:?la variable AUDIT_TOMBSTONE_DAYS es obligatoria en .env}
       # Credenciales de AWS: cadena estándar del SDK. En local vienen de .env; en
       # producción, del rol IAM. Audit nunca recibe la clave privada de Audit ni las
       # claves AES de otros servicios: si se definieran, el servicio no arranca.

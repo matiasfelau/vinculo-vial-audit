@@ -69,38 +69,58 @@ declara topología.
 
 Comportamiento de cada consumidor:
 
-- **recorded.** Valida los UUID, `alert_type` (`CRASHED` o `PARKED_ON_GARAGE`), `created_at`
+- **recorded.** Si la alerta ya tiene tombstone, hace ack sin insertar. Valida los UUID, `alert_type` (`CRASHED` o `PARKED_ON_GARAGE`), `created_at`
   (RFC3339), `audit_key_id` y que los criptogramas sean base64 no vacío. Inserta con
   `ON CONFLICT DO NOTHING` y calcula `destroy_at`. Un `recorded` repetido no cambia nada.
-- **delivered.** Si el registro no existe, es transitorio (`.retry`). Si ya está `DELIVERED`,
+- **delivered.** Si el registro no existe, es transitorio (`.retry`); si no existe pero la alerta
+  tiene tombstone, es una inconsistencia de Alert y va a la DLQ sin reintento. Si ya está `DELIVERED`,
   hace ack. Valida que `bucket` sea `EVIDENCE_BUCKET` y que cada clave sea
   `alerts/{alert_id}/redacted/…`. Por cada foto: la lee, verifica el SHA-256 (si no coincide, DLQ)
   y la sube a `records/{alert_id}/{role}-{index}.jpg` con Object Lock hasta `destroy_at`.
   Después escribe `manifest.json` bloqueado y actualiza la fila en una transacción. Un
   reintento tras una subida parcial crea versiones nuevas: es aceptable, el sweeper borra todas.
-- **discarded.** Si el registro no existe, es transitorio. Si está `RECORDED`, lo borra. Si está
-  `DELIVERED`, hace ack sin borrar y registra un WARN solo con el `alert_id`: un registro
-  entregado nunca se borra antes de su vencimiento.
+- **discarded.** Si está `RECORDED`, borra el registro e inserta el tombstone en la misma
+  transacción. Si está `DELIVERED`, hace ack sin borrar y registra un WARN solo con el
+  `alert_id`: un registro entregado nunca se borra antes de su vencimiento. Si no hay registro
+  pero sí tombstone, hace ack (duplicado de un descarte ya resuelto). Si no hay ni registro ni
+  tombstone, es transitorio (puede haber llegado antes que `recorded`).
 
 Clasificación de errores:
 
 | Tipo | Casos | Resultado |
 |---|---|---|
-| Permanente | payload ilegible o inválido, SHA-256 distinto, `destroy_at` ya vencido, panic del procesador | DLQ directa, sin reintento |
+| Permanente | payload ilegible o inválido, SHA-256 distinto, `destroy_at` ya vencido, `delivered` sobre una alerta descartada, panic del procesador | DLQ directa, sin reintento |
 | Transitorio | registro inexistente (orden invertido), base o S3 caídos, circuito abierto | nack a `.retry`; tras `MAX_RETRIES`, DLQ |
 
 Con `MAX_RETRIES=10` y el `RETRY_TTL_MS` de 30 s de Core, se cubren 5 minutos de desorden entre
 `recorded` y `delivered`/`discarded`.
 
-**Limitación conocida del contrato:** un `discarded` repetido *después* de que el registro ya se
-borró se trata como "registro inexistente" (transitorio) y termina en la DLQ tras agotar los
-reintentos. Es el comportamiento que fija el contrato; no hay lápida que permita distinguirlo.
+### Tombstones de descartes
+
+Con entrega al menos una vez, un `discarded` duplicado llega después del borrado, y un `recorded`
+duplicado puede llegar después del descarte: sin más datos, el primero terminaría en la DLQ y el
+segundo recrearía un registro con DNI que nadie borraría hasta su vencimiento. Por eso cada
+descarte deja un **tombstone** en `discarded_alerts` (`alert_id`, `discarded_at`; **sin datos
+personales**), que se inserta en la misma transacción que el borrado del registro.
+
+| Evento | Registro | Tombstone | Resultado |
+|---|---|---|---|
+| `discarded` | `RECORDED` | — | borra el registro e inserta el tombstone; ack |
+| `discarded` | `DELIVERED` | — | ack sin borrar, WARN con el `alert_id` |
+| `discarded` | no existe | sí | ack |
+| `discarded` | no existe | no | transitorio (`.retry`); tras `MAX_RETRIES`, DLQ |
+| `recorded` | — | sí | ack, sin insertar |
+| `delivered` | no existe | sí | DLQ (inconsistencia de Alert) |
+
+El sweeper borra los tombstones con más de `AUDIT_TOMBSTONE_DAYS` días. Debe cubrir la ventana
+en la que el broker puede reentregar un evento; pasada esa ventana, un `recorded` o `discarded`
+duplicado ya no se reconoce.
 
 ## Base de datos
 
 Base propia (`audit-db`), tabla `audit_records`, creada por las migraciones versionadas de
 `internal/repository/postgres/migrations` (se aplican al arrancar, con un advisory lock para
-réplicas concurrentes). Un trigger impide modificar los datos de origen de un registro
+réplicas concurrentes) y crean `audit_records` y `discarded_alerts`. Un trigger impide modificar los datos de origen de un registro
 (`alert_id`, `alert_type`, `alert_created_at`, criptogramas, `audit_key_id`, `recorded_at` y
 `destroy_at`); solo cambian el estado de entrega y `judicial_hold`.
 
@@ -126,6 +146,7 @@ proceso termina con código distinto de cero.
 | `RABBITMQ_URL` | obligatoria | Broker. |
 | `AUDIT_RETENTION_DAYS` | obligatoria (1095) | Días de conservación desde la creación de la alerta (art. 2561 del CCyC; cubre el art. 62 del CP). En desarrollo, un valor bajo. |
 | `AUDIT_OBJECT_LOCK_MODE` | obligatoria | `GOVERNANCE` en desarrollo; `COMPLIANCE` solo en producción (ni root puede borrar antes de tiempo). |
+| `AUDIT_TOMBSTONE_DAYS` | obligatoria (7) | Días que se conserva el tombstone de un descarte. |
 | `AUDIT_BUCKET` | obligatoria | `vinculo-vial-audit-<entorno>-<sufijo>`. Igual que en Core. |
 | `EVIDENCE_BUCKET`, `S3_REGION` | obligatorias | Bucket de evidencia (solo lectura de `alerts/*/redacted/*`) y región. |
 | `MAX_RETRIES` | 10 | Reintentos de un fallo transitorio antes de la DLQ. |
@@ -158,7 +179,8 @@ Cada `AUDIT_SWEEP_INTERVAL` recorre, por páginas, los registros con `destroy_at
 `judicial_hold = false` (incluidos los `RECORDED` huérfanos, que nunca recibieron su
 `discarded`). Para cada uno borra todas las versiones de los objetos de `records/{alert_id}/` y
 después la fila. Si S3 rechaza el borrado porque la retención sigue vigente, lo reintenta en la
-vuelta siguiente; si la fila falla a mitad de camino, la vuelta siguiente la retoma.
+vuelta siguiente; si la fila falla a mitad de camino, la vuelta siguiente la retoma. En cada
+vuelta también depura los tombstones con más de `AUDIT_TOMBSTONE_DAYS`.
 
 ## Ejecución local
 

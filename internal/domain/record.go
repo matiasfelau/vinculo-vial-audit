@@ -90,3 +90,15 @@ type ExportFilter struct {
 	From    time.Time
 	To      time.Time
 }
+
+// InsertResult es el desenlace de insertar un registro.
+type InsertResult int
+
+const (
+	// InsertCreated indica que se creó el registro.
+	InsertCreated InsertResult = iota
+	// InsertExisting indica que ya existía un registro con ese alert_id: no se cambió nada.
+	InsertExisting
+	// InsertTombstoned indica que la alerta ya fue descartada: no se insertó nada.
+	InsertTombstoned
+)

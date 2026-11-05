@@ -49,9 +49,9 @@ func newRepo(t *testing.T) (*postgres.AuditRepository, *gorm.DB) {
 
 func mustInsert(t *testing.T, repo *postgres.AuditRepository, record domain.Record) {
 	t.Helper()
-	inserted, err := repo.Insert(context.Background(), record)
-	if err != nil || !inserted {
-		t.Fatalf("no se pudo insertar el registro: inserted=%v err=%v", inserted, err)
+	result, err := repo.Insert(context.Background(), record)
+	if err != nil || result != domain.InsertCreated {
+		t.Fatalf("no se pudo insertar el registro: result=%v err=%v", result, err)
 	}
 }
 
@@ -63,8 +63,8 @@ func TestMigrateCreaLaTablaYEsIdempotente(t *testing.T) {
 	}
 
 	var applied int64
-	if err := db.Raw("SELECT count(*) FROM schema_migrations").Scan(&applied).Error; err != nil || applied != 1 {
-		t.Fatalf("migraciones registradas = %d (err %v), esperaba 1", applied, err)
+	if err := db.Raw("SELECT count(*) FROM schema_migrations").Scan(&applied).Error; err != nil || applied != 2 {
+		t.Fatalf("migraciones registradas = %d (err %v), esperaba 2", applied, err)
 	}
 
 	columns := map[string]string{}
@@ -119,7 +119,7 @@ func TestMigrateCreaLaTablaYEsIdempotente(t *testing.T) {
 func TestMigrateConcurrenteNoDuplicaNiFalla(t *testing.T) {
 	_, db := newRepo(t)
 	// Se vuelve a un esquema vacío para que las réplicas compitan por aplicar.
-	if err := db.Exec("DROP TABLE audit_records; DROP TABLE schema_migrations; DROP FUNCTION audit_records_forbid_origin_update()").Error; err != nil {
+	if err := db.Exec("DROP TABLE audit_records; DROP TABLE discarded_alerts; DROP TABLE schema_migrations; DROP FUNCTION audit_records_forbid_origin_update()").Error; err != nil {
 		t.Fatal(err)
 	}
 
@@ -141,8 +141,8 @@ func TestMigrateConcurrenteNoDuplicaNiFalla(t *testing.T) {
 	}
 	var applied int64
 	db.Raw("SELECT count(*) FROM schema_migrations").Scan(&applied)
-	if applied != 1 {
-		t.Errorf("migraciones registradas = %d, esperaba 1", applied)
+	if applied != 2 {
+		t.Errorf("migraciones registradas = %d, esperaba 2", applied)
 	}
 }
 
@@ -154,13 +154,13 @@ func TestInsertConOnConflictNoCambiaElRegistroExistente(t *testing.T) {
 	repetido := original
 	repetido.DNIEncAudit = "b3Rybw=="
 	repetido.AuditKeyID = "otra"
-	inserted, err := repo.Insert(context.Background(), repetido)
+	result, err := repo.Insert(context.Background(), repetido)
 
 	if err != nil {
 		t.Fatalf("un insert repetido no debe fallar: %v", err)
 	}
-	if inserted {
-		t.Error("un insert repetido no debe reportar una inserción")
+	if result != domain.InsertExisting {
+		t.Errorf("resultado = %v, esperaba InsertExisting", result)
 	}
 	got, err := repo.Get(context.Background(), original.AlertID)
 	if err != nil {
@@ -260,7 +260,7 @@ func TestMarkDeliveredSobreUnRegistroYaEntregadoNoHaceNada(t *testing.T) {
 	}
 }
 
-func TestDeleteRecordedSoloBorraRegistrosRecorded(t *testing.T) {
+func TestDiscardRecordedSoloBorraRegistrosRecordedYDejaElTombstone(t *testing.T) {
 	repo, _ := newRepo(t)
 	pending, delivered := newRecord(base, time.Hour), newRecord(base, time.Hour)
 	mustInsert(t, repo, pending)
@@ -269,13 +269,13 @@ func TestDeleteRecordedSoloBorraRegistrosRecorded(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deletedPending, err := repo.DeleteRecorded(context.Background(), pending.AlertID)
-	if err != nil || !deletedPending {
-		t.Fatalf("el RECORDED debía borrarse: %v, %v", deletedPending, err)
+	discardedPending, err := repo.DiscardRecorded(context.Background(), pending.AlertID, base)
+	if err != nil || !discardedPending {
+		t.Fatalf("el RECORDED debía descartarse: %v, %v", discardedPending, err)
 	}
-	deletedDelivered, err := repo.DeleteRecorded(context.Background(), delivered.AlertID)
-	if err != nil || deletedDelivered {
-		t.Fatalf("un DELIVERED nunca se borra antes de su vencimiento: %v, %v", deletedDelivered, err)
+	discardedDelivered, err := repo.DiscardRecorded(context.Background(), delivered.AlertID, base)
+	if err != nil || discardedDelivered {
+		t.Fatalf("un DELIVERED nunca se borra antes de su vencimiento: %v, %v", discardedDelivered, err)
 	}
 
 	if _, err := repo.Get(context.Background(), pending.AlertID); !errors.Is(err, domain.ErrRecordNotFound) {
@@ -283,6 +283,91 @@ func TestDeleteRecordedSoloBorraRegistrosRecorded(t *testing.T) {
 	}
 	if _, err := repo.Get(context.Background(), delivered.AlertID); err != nil {
 		t.Errorf("el DELIVERED desapareció: %v", err)
+	}
+	if tombstoned, _ := repo.HasTombstone(context.Background(), pending.AlertID); !tombstoned {
+		t.Error("el descartado debe dejar tombstone")
+	}
+	if tombstoned, _ := repo.HasTombstone(context.Background(), delivered.AlertID); tombstoned {
+		t.Error("el entregado no debe tener tombstone")
+	}
+}
+
+func TestDiscardRecordedEsAtomicoBorradoYTombstone(t *testing.T) {
+	repo, db := newRepo(t)
+	record := newRecord(base, time.Hour)
+	mustInsert(t, repo, record)
+	// Un tombstone previo con otra fecha haría fallar un INSERT sin ON CONFLICT; con
+	// ON CONFLICT DO NOTHING el descarte igual completa el borrado.
+	if err := db.Exec("INSERT INTO discarded_alerts (alert_id, discarded_at) VALUES (?, ?)", record.AlertID, base.Add(-time.Hour)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	discarded, err := repo.DiscardRecorded(context.Background(), record.AlertID, base)
+
+	if err != nil || !discarded {
+		t.Fatalf("discarded=%v err=%v", discarded, err)
+	}
+	var count int64
+	db.Raw("SELECT count(*) FROM discarded_alerts WHERE alert_id = ?", record.AlertID).Scan(&count)
+	if count != 1 {
+		t.Errorf("tombstones = %d, esperaba 1", count)
+	}
+}
+
+func TestInsertSobreAlertaDescartadaNoInserta(t *testing.T) {
+	repo, _ := newRepo(t)
+	record := newRecord(base, time.Hour)
+	mustInsert(t, repo, record)
+	if discarded, err := repo.DiscardRecorded(context.Background(), record.AlertID, base); err != nil || !discarded {
+		t.Fatalf("descarte: %v, %v", discarded, err)
+	}
+
+	result, err := repo.Insert(context.Background(), record)
+
+	if err != nil || result != domain.InsertTombstoned {
+		t.Fatalf("result=%v err=%v, esperaba InsertTombstoned", result, err)
+	}
+	if _, err := repo.Get(context.Background(), record.AlertID); !errors.Is(err, domain.ErrRecordNotFound) {
+		t.Error("un recorded duplicado no debe recrear el registro")
+	}
+}
+
+func TestDeleteTombstonesBeforeBorraSoloLosAnteriores(t *testing.T) {
+	repo, _ := newRepo(t)
+	old, recent := newRecord(base, time.Hour), newRecord(base, time.Hour)
+	mustInsert(t, repo, old)
+	mustInsert(t, repo, recent)
+	if _, err := repo.DiscardRecorded(context.Background(), old.AlertID, base.Add(-48*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.DiscardRecorded(context.Background(), recent.AlertID, base); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := repo.DeleteTombstonesBefore(context.Background(), base.Add(-24*time.Hour))
+
+	if err != nil || deleted != 1 {
+		t.Fatalf("deleted=%d err=%v, esperaba 1", deleted, err)
+	}
+	if tombstoned, _ := repo.HasTombstone(context.Background(), old.AlertID); tombstoned {
+		t.Error("el tombstone viejo debía borrarse")
+	}
+	if tombstoned, _ := repo.HasTombstone(context.Background(), recent.AlertID); !tombstoned {
+		t.Error("el tombstone reciente debía conservarse")
+	}
+}
+
+func TestElTombstoneNoGuardaDatosPersonales(t *testing.T) {
+	_, db := newRepo(t)
+
+	var columns []string
+	if err := db.Raw(`SELECT column_name FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'discarded_alerts' ORDER BY column_name`).Scan(&columns).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if len(columns) != 2 || columns[0] != "alert_id" || columns[1] != "discarded_at" {
+		t.Errorf("columnas del tombstone = %v, esperaba solo alert_id y discarded_at", columns)
 	}
 }
 

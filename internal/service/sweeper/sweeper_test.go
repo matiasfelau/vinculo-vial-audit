@@ -15,6 +15,8 @@ import (
 
 var clock = time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
 
+const tombstoneRetention = 7 * 24 * time.Hour
+
 type fixture struct {
 	store   *testsupport.MemoryStore
 	objects *testsupport.MemoryObjects
@@ -25,7 +27,7 @@ type fixture struct {
 func newFixture(batchSize int) *fixture {
 	f := &fixture{store: testsupport.NewMemoryStore(), objects: testsupport.NewMemoryObjects(), now: clock}
 	f.objects.Now = func() time.Time { return f.now }
-	f.sweeper = New(f.store, f.objects, batchSize)
+	f.sweeper = New(f.store, f.objects, batchSize, tombstoneRetention)
 	f.sweeper.now = func() time.Time { return f.now }
 	return f
 }
@@ -216,6 +218,9 @@ func (f failingList) Get(context.Context, uuid.UUID) (domain.Record, error) {
 func (f failingList) DeleteExpired(context.Context, uuid.UUID, time.Time) (bool, error) {
 	return false, f.err
 }
+func (f failingList) DeleteTombstonesBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
 
 func TestRunOnceConContextoCanceladoSeDetiene(t *testing.T) {
 	f := newFixture(10)
@@ -245,5 +250,58 @@ func TestRunTerminaAlCancelarElContexto(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run no terminó al cancelarse el contexto")
+	}
+}
+
+func TestRunOnceDepuraLosTombstonesConMasDeLaRetencion(t *testing.T) {
+	f := newFixture(10)
+	viejo, limite, reciente := uuid.New(), uuid.New(), uuid.New()
+	f.store.AddTombstone(viejo, clock.Add(-tombstoneRetention-time.Second))
+	f.store.AddTombstone(limite, clock.Add(-tombstoneRetention))
+	f.store.AddTombstone(reciente, clock.Add(-time.Hour))
+
+	result, err := f.sweeper.RunOnce(context.Background())
+
+	if err != nil {
+		t.Fatalf("error inesperado: %v", err)
+	}
+	if result.TombstonesDeleted != 1 {
+		t.Errorf("tombstones depurados = %d, esperaba 1 (solo el que supera AUDIT_TOMBSTONE_DAYS)", result.TombstonesDeleted)
+	}
+	if f.store.TombstoneCount() != 2 {
+		t.Errorf("quedan %d tombstones, esperaba 2", f.store.TombstoneCount())
+	}
+}
+
+func TestRunOnceDepuraTombstonesAunSiFallaLaListaDeRegistros(t *testing.T) {
+	f := newFixture(10)
+	f.store.AddTombstone(uuid.New(), clock.Add(-2*tombstoneRetention))
+	f.sweeper.store = tombstonesOnly{MemoryStore: f.store}
+
+	result, err := f.sweeper.RunOnce(context.Background())
+
+	if !errors.Is(err, domain.ErrRepositoryUnavailable) {
+		t.Fatalf("esperaba el error de la lista, obtuvo %v", err)
+	}
+	if result.TombstonesDeleted != 1 {
+		t.Errorf("tombstones depurados = %d, esperaba 1", result.TombstonesDeleted)
+	}
+}
+
+// tombstonesOnly falla al listar registros pero depura tombstones.
+type tombstonesOnly struct{ *testsupport.MemoryStore }
+
+func (tombstonesOnly) ListExpired(context.Context, time.Time, uuid.UUID, int) ([]uuid.UUID, error) {
+	return nil, domain.ErrRepositoryUnavailable
+}
+
+func TestRunOnceNoBorraTombstonesDeAlertasConRegistroVivo(t *testing.T) {
+	f := newFixture(10)
+	f.add(domain.StatusRecorded, clock.Add(time.Hour), false)
+
+	result, err := f.sweeper.RunOnce(context.Background())
+
+	if err != nil || result.TombstonesDeleted != 0 {
+		t.Fatalf("resultado = %+v, %v", result, err)
 	}
 }

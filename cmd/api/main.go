@@ -29,6 +29,9 @@ import (
 // Plazos del *http.Server. Sin ellos, el server de Go no aplica ningún límite de
 // lectura ni de escritura. shutdownTimeout acota cuánto espera el apagado
 // ordenado a que las peticiones en vuelo terminen antes de cortarlas.
+// hoursPerDay convierte AUDIT_TOMBSTONE_DAYS a una duración.
+const hoursPerDay = 24
+
 const (
 	httpReadHeaderTimeout = 5 * time.Second
 	httpReadTimeout       = 10 * time.Second
@@ -129,7 +132,7 @@ func run() error {
 	background.Add(1)
 	go func() {
 		defer background.Done()
-		sweeper.New(repository, auditStore, cfg.SweepBatchSize).Run(ctx, cfg.SweepInterval)
+		sweeper.New(repository, auditStore, cfg.SweepBatchSize, time.Duration(cfg.TombstoneDays)*hoursPerDay*time.Hour).Run(ctx, cfg.SweepInterval)
 	}()
 
 	slog.Info("audit service escuchando", "port", cfg.Port)

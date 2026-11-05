@@ -496,3 +496,57 @@ func TestIntegracionPayloadInvalidoVaALaDLQSinReintento(t *testing.T) {
 		t.Errorf("hay %d registros, esperaba 0", total)
 	}
 }
+
+// Con entrega al menos una vez, un discarded duplicado llega después del borrado y
+// un recorded duplicado puede llegar después del descarte. Con el tombstone, el
+// primero hace ack (no llega a la DLQ) y el segundo no recrea el registro.
+func TestIntegracionDuplicadosPosterioresAlDescarteHacenAckYNoRecreanElRegistro(t *testing.T) {
+	e := nuevoEntorno(t)
+	id := uuid.New()
+	e.publicarRecorded(id)
+	if !esperar(func() bool { return e.existe(id) }) {
+		t.Fatal("el registro no se creó")
+	}
+	e.publicarDiscarded(id, "REJECTED")
+	if !esperar(func() bool { return !e.existe(id) }) {
+		t.Fatal("el registro no se descartó")
+	}
+
+	e.publicarDiscarded(id, "REJECTED")
+	e.publicarRecorded(id)
+
+	if !esperar(func() bool { return e.discardedCalls.calls.Load() == 2 && e.recordedCalls.calls.Load() == 2 }) {
+		t.Fatalf("no se procesaron los duplicados (discarded=%d, recorded=%d)", e.discardedCalls.calls.Load(), e.recordedCalls.calls.Load())
+	}
+	e.exigirTodoConfirmado()
+	if e.existe(id) {
+		t.Error("un recorded duplicado tras el descarte no debe recrear el registro")
+	}
+	if n := e.discardedCalls.calls.Load(); n != 2 {
+		t.Errorf("discarded se procesó %d veces, esperaba 2 (sin reintentos)", n)
+	}
+}
+
+func TestIntegracionDeliveredSobreAlertaDescartadaVaALaDLQSinReintento(t *testing.T) {
+	e := nuevoEntorno(t)
+	id := uuid.New()
+	e.publicarRecorded(id)
+	if !esperar(func() bool { return e.existe(id) }) {
+		t.Fatal("el registro no se creó")
+	}
+	e.publicarDiscarded(id, "UNCLAIMED")
+	if !esperar(func() bool { return !e.existe(id) }) {
+		t.Fatal("el registro no se descartó")
+	}
+
+	e.publicarDelivered(id, nil)
+
+	esperarEnDLQ(t, e.ch, e.delivered)
+	e.stop()
+	if n := e.deliveredCalls.calls.Load(); n != 1 {
+		t.Errorf("delivered se procesó %d veces, esperaba 1 (inconsistencia de Alert, sin reintento)", n)
+	}
+	if len(e.audit.Keys()) != 0 {
+		t.Errorf("no debe subir objetos: %v", e.audit.Keys())
+	}
+}

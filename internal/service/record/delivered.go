@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -24,6 +25,7 @@ const minRetentionRemaining = time.Minute
 // deliveryStore es lo que Deliverer necesita de la persistencia.
 type deliveryStore interface {
 	Get(ctx context.Context, alertID uuid.UUID) (domain.Record, error)
+	HasTombstone(ctx context.Context, alertID uuid.UUID) (bool, error)
 	MarkDelivered(ctx context.Context, alertID uuid.UUID, delivery domain.Delivery) (bool, error)
 }
 
@@ -63,13 +65,18 @@ func NewDeliverer(store deliveryStore, evidence evidenceReader, audit auditWrite
 //
 // Errores:
 //   - domain.ErrRecordNotFound: el registro no existe todavía (transitorio);
-//   - domain.ErrIntegrity y domain.ErrRetentionElapsed: permanentes;
+//   - domain.ErrIntegrity, domain.ErrRetentionElapsed y domain.ErrAlertDiscarded
+//     (la alerta ya fue descartada: delivered es una inconsistencia de Alert):
+//     permanentes;
 //   - cualquier otro (S3 o base caídos): transitorio.
 //
 // Un reintento tras una subida parcial crea versiones nuevas de los objetos: es
 // aceptable, el sweeper borra todas las versiones.
 func (d *Deliverer) Deliver(ctx context.Context, in DeliveredInput) error {
 	record, err := d.store.Get(ctx, in.AlertID)
+	if errors.Is(err, domain.ErrRecordNotFound) {
+		return d.resolveMissing(ctx, in.AlertID, err)
+	}
 	if err != nil {
 		return fmt.Errorf("no se pudo leer el registro: %w", err)
 	}
@@ -122,6 +129,20 @@ func (d *Deliverer) Deliver(ctx context.Context, in DeliveredInput) error {
 
 	slog.Info("registro entregado", "alert_id", in.AlertID, "fotos", len(archived))
 	return nil
+}
+
+// resolveMissing resuelve un delivered sin registro: con tombstone es una
+// inconsistencia de Alert (permanente); sin él, el recorded todavía no llegó
+// (transitorio).
+func (d *Deliverer) resolveMissing(ctx context.Context, alertID uuid.UUID, notFound error) error {
+	tombstoned, err := d.store.HasTombstone(ctx, alertID)
+	if err != nil {
+		return fmt.Errorf("no se pudo consultar el tombstone: %w", err)
+	}
+	if tombstoned {
+		return fmt.Errorf("alerta %s: %w", alertID, domain.ErrAlertDiscarded)
+	}
+	return fmt.Errorf("no se pudo leer el registro: %w", notFound)
 }
 
 // archivePhotos lee cada foto del bucket de evidencia, verifica su SHA-256 y la

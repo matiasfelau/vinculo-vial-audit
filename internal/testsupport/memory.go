@@ -21,6 +21,8 @@ import (
 type MemoryStore struct {
 	mu      sync.Mutex
 	records map[uuid.UUID]domain.Record
+	// tombstones guarda el instante de descarte de cada alerta descartada.
+	tombstones map[uuid.UUID]time.Time
 
 	// ErrGet, ErrInsert, ErrMarkDelivered y ErrDelete fuerzan el error de la
 	// operación correspondiente.
@@ -35,7 +37,7 @@ type MemoryStore struct {
 
 // NewMemoryStore construye una base vacía.
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{records: make(map[uuid.UUID]domain.Record)}
+	return &MemoryStore{records: make(map[uuid.UUID]domain.Record), tombstones: make(map[uuid.UUID]time.Time)}
 }
 
 // Put agrega o reemplaza un registro directamente.
@@ -60,20 +62,64 @@ func (s *MemoryStore) Len() int {
 	return len(s.records)
 }
 
-// Insert implementa la inserción con ON CONFLICT DO NOTHING.
-func (s *MemoryStore) Insert(_ context.Context, record domain.Record) (bool, error) {
+// Insert implementa la inserción con ON CONFLICT DO NOTHING y respeta el tombstone.
+func (s *MemoryStore) Insert(_ context.Context, record domain.Record) (domain.InsertResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.InsertCalls++
 	if s.ErrInsert != nil {
-		return false, s.ErrInsert
+		return domain.InsertCreated, s.ErrInsert
+	}
+	if _, discarded := s.tombstones[record.AlertID]; discarded {
+		return domain.InsertTombstoned, nil
 	}
 	if _, exists := s.records[record.AlertID]; exists {
-		return false, nil
+		return domain.InsertExisting, nil
 	}
 	s.records[record.AlertID] = record
-	return true, nil
+	return domain.InsertCreated, nil
+}
+
+// AddTombstone agrega directamente el tombstone de una alerta.
+func (s *MemoryStore) AddTombstone(id uuid.UUID, discardedAt time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tombstones[id] = discardedAt
+}
+
+// HasTombstone indica si la alerta fue descartada.
+func (s *MemoryStore) HasTombstone(_ context.Context, id uuid.UUID) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.ErrGet != nil {
+		return false, s.ErrGet
+	}
+	_, ok := s.tombstones[id]
+	return ok, nil
+}
+
+// TombstoneCount devuelve la cantidad de tombstones.
+func (s *MemoryStore) TombstoneCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.tombstones)
+}
+
+// DeleteTombstonesBefore borra los tombstones anteriores a cutoff.
+func (s *MemoryStore) DeleteTombstonesBefore(_ context.Context, cutoff time.Time) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var deleted int64
+	for id, at := range s.tombstones {
+		if at.Before(cutoff) {
+			delete(s.tombstones, id)
+			deleted++
+		}
+	}
+	return deleted, nil
 }
 
 // Get devuelve el registro o domain.ErrRecordNotFound.
@@ -113,8 +159,8 @@ func (s *MemoryStore) MarkDelivered(_ context.Context, id uuid.UUID, delivery do
 	return true, nil
 }
 
-// DeleteRecorded borra el registro solo si está RECORDED.
-func (s *MemoryStore) DeleteRecorded(_ context.Context, id uuid.UUID) (bool, error) {
+// DiscardRecorded borra el registro si está RECORDED e inserta el tombstone.
+func (s *MemoryStore) DiscardRecorded(_ context.Context, id uuid.UUID, discardedAt time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -126,6 +172,7 @@ func (s *MemoryStore) DeleteRecorded(_ context.Context, id uuid.UUID) (bool, err
 		return false, nil
 	}
 	delete(s.records, id)
+	s.tombstones[id] = discardedAt
 	return true, nil
 }
 

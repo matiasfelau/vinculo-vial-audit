@@ -33,6 +33,10 @@ const (
 	LockModeGovernance = "GOVERNANCE"
 	LockModeCompliance = "COMPLIANCE"
 
+	// maxTombstoneDays acota AUDIT_TOMBSTONE_DAYS (10 años): el tombstone solo tiene
+	// que cubrir la ventana de duplicados del broker.
+	maxTombstoneDays = 3650
+
 	// Hasta 1 GiB por objeto: un tope mayor no tiene sentido para una foto y deja
 	// sin protección a la memoria del proceso.
 	maxObjectBytesCeiling = 1 << 30
@@ -86,6 +90,11 @@ type Config struct {
 
 	SweepInterval  time.Duration
 	SweepBatchSize int
+
+	// TombstoneDays es AUDIT_TOMBSTONE_DAYS: cuánto se conserva el tombstone de un
+	// descarte (alert_id y fecha, sin datos personales). Debe cubrir la ventana en
+	// la que puede llegar un recorded o un discarded duplicado.
+	TombstoneDays int
 }
 
 // CLIConfig agrupa los parámetros de auditctl, que usa las credenciales de la
@@ -126,6 +135,9 @@ func Load() (*Config, error) {
 	}
 
 	cfg.S3 = r.s3()
+
+	// Cuánto dura el tombstone también es una decisión del despliegue: sin default.
+	cfg.TombstoneDays = int(r.intRange("AUDIT_TOMBSTONE_DAYS", "", 1, maxTombstoneDays, false))
 
 	cfg.SweepInterval = r.duration("AUDIT_SWEEP_INTERVAL", "1h")
 	cfg.SweepBatchSize = int(r.intRange("AUDIT_SWEEP_BATCH_SIZE", "500", 1, math.MaxInt32, true))

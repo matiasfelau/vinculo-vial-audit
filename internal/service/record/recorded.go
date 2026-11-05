@@ -19,7 +19,7 @@ const hoursPerDay = 24
 
 // recordWriter es lo que Recorder necesita de la persistencia.
 type recordWriter interface {
-	Insert(ctx context.Context, record domain.Record) (bool, error)
+	Insert(ctx context.Context, record domain.Record) (domain.InsertResult, error)
 }
 
 // RecordedInput son los datos validados de audit.alert.recorded.
@@ -46,11 +46,14 @@ func NewRecorder(store recordWriter, retentionDays int) *Recorder {
 
 // Record inserta el registro en estado RECORDED con destroy_at igual a la
 // creación de la alerta más la retención. Es idempotente: un recorded repetido
-// no cambia nada. Los criptogramas se guardan tal como llegan.
+// no cambia nada. Si la alerta ya fue descartada (tombstone), hace ack sin
+// insertar: de lo contrario un recorded duplicado recrearía un registro con DNI
+// que nadie borraría hasta su vencimiento. Los criptogramas se guardan tal como
+// llegan.
 func (r *Recorder) Record(ctx context.Context, in RecordedInput) error {
 	createdAt := truncateToStorage(in.CreatedAt)
 
-	inserted, err := r.store.Insert(ctx, domain.Record{
+	result, err := r.store.Insert(ctx, domain.Record{
 		AlertID:        in.AlertID,
 		AlertType:      in.AlertType,
 		AlertCreatedAt: createdAt,
@@ -65,8 +68,11 @@ func (r *Recorder) Record(ctx context.Context, in RecordedInput) error {
 		return fmt.Errorf("no se pudo crear el registro: %w", err)
 	}
 
-	if !inserted {
+	switch result {
+	case domain.InsertExisting:
 		slog.Info("registro ya existente, recorded repetido sin cambios", "alert_id", in.AlertID)
+	case domain.InsertTombstoned:
+		slog.Info("alerta ya descartada, recorded sin efecto", "alert_id", in.AlertID)
 	}
 	return nil
 }

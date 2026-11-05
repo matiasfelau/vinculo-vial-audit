@@ -19,6 +19,7 @@ type expiredStore interface {
 	ListExpired(ctx context.Context, now time.Time, after uuid.UUID, limit int) ([]uuid.UUID, error)
 	Get(ctx context.Context, alertID uuid.UUID) (domain.Record, error)
 	DeleteExpired(ctx context.Context, alertID uuid.UUID, now time.Time) (bool, error)
+	DeleteTombstonesBefore(ctx context.Context, cutoff time.Time) (int64, error)
 }
 
 // objectPurger borra todas las versiones de los objetos bajo un prefijo.
@@ -33,16 +34,20 @@ type Result struct {
 	// Retained son los registros cuyo borrado S3 rechazó porque la retención sigue
 	// vigente; se reintentan en la vuelta siguiente.
 	Retained int
-	// Failed son los registros que fallaron por otra causa; también se reintentan.
+	// Failed son los registros (o la depuración de tombstones) que fallaron por otra
+	// causa; también se reintentan.
 	Failed int
+	// TombstonesDeleted son los tombstones de descartes depurados por antigüedad.
+	TombstonesDeleted int
 }
 
 // Sweeper destruye los registros con destroy_at <= now y sin retención judicial.
 type Sweeper struct {
-	store     expiredStore
-	purger    objectPurger
-	batchSize int
-	now       func() time.Time
+	store              expiredStore
+	purger             objectPurger
+	batchSize          int
+	tombstoneRetention time.Duration
+	now                func() time.Time
 }
 
 // Option configura aspectos opcionales del Sweeper.
@@ -54,9 +59,11 @@ func WithClock(now func() time.Time) Option {
 	return func(s *Sweeper) { s.now = now }
 }
 
-// New construye el sweeper. batchSize acota cuántos registros se leen por página.
-func New(store expiredStore, purger objectPurger, batchSize int, opts ...Option) *Sweeper {
-	s := &Sweeper{store: store, purger: purger, batchSize: batchSize, now: func() time.Time { return time.Now().UTC() }}
+// New construye el sweeper. batchSize acota cuántos registros se leen por página y
+// tombstoneRetention (AUDIT_TOMBSTONE_DAYS) cuánto se conserva el tombstone de un
+// descarte.
+func New(store expiredStore, purger objectPurger, batchSize int, tombstoneRetention time.Duration, opts ...Option) *Sweeper {
+	s := &Sweeper{store: store, purger: purger, batchSize: batchSize, tombstoneRetention: tombstoneRetention, now: func() time.Time { return time.Now().UTC() }}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -67,29 +74,54 @@ func New(store expiredStore, purger objectPurger, batchSize int, opts ...Option)
 // con un cursor de alert_id, de modo que uno que falla no bloquea a los demás ni
 // se reintenta dentro de la misma vuelta. Es idempotente: si la fila quedó a
 // medio borrar (los objetos ya no están), la vuelta siguiente la retoma.
+//
+// Además depura los tombstones de descartes con más de tombstoneRetention, aun
+// si la destrucción de registros falló.
 func (s *Sweeper) RunOnce(ctx context.Context) (Result, error) {
 	var result Result
 	now := s.now()
+
+	err := s.sweepRecords(ctx, now, &result)
+	s.purgeTombstones(ctx, now, &result)
+	return result, err
+}
+
+// sweepRecords destruye los registros vencidos, página por página.
+func (s *Sweeper) sweepRecords(ctx context.Context, now time.Time, result *Result) error {
 	cursor := uuid.Nil
 
 	for {
 		ids, err := s.store.ListExpired(ctx, now, cursor, s.batchSize)
 		if err != nil {
-			return result, err
+			return err
 		}
 
 		for _, id := range ids {
 			if err := ctx.Err(); err != nil {
-				return result, err
+				return err
 			}
-			s.destroy(ctx, id, now, &result)
+			s.destroy(ctx, id, now, result)
 			cursor = id
 		}
 
 		if len(ids) < s.batchSize {
-			return result, nil
+			return nil
 		}
 	}
+}
+
+// purgeTombstones borra los tombstones con más de tombstoneRetention.
+func (s *Sweeper) purgeTombstones(ctx context.Context, now time.Time, result *Result) {
+	if ctx.Err() != nil {
+		return
+	}
+	deleted, err := s.store.DeleteTombstonesBefore(ctx, now.Add(-s.tombstoneRetention))
+	if err != nil {
+		result.Failed++
+		slog.Error("sweeper: no se pudieron depurar los tombstones de descartes", "error", err.Error())
+		return
+	}
+	result.TombstonesDeleted = int(deleted)
 }
 
 // destroy destruye un registro y acumula el resultado.
@@ -154,6 +186,6 @@ func (s *Sweeper) runAndLog(ctx context.Context) {
 		slog.Error("sweeper: la vuelta falló", "error", err.Error())
 	}
 	if result != (Result{}) {
-		slog.Info("sweeper: vuelta completada", "destruidos", result.Destroyed, "retenidos", result.Retained, "fallidos", result.Failed)
+		slog.Info("sweeper: vuelta completada", "destruidos", result.Destroyed, "retenidos", result.Retained, "fallidos", result.Failed, "tombstones_depurados", result.TombstonesDeleted)
 	}
 }
