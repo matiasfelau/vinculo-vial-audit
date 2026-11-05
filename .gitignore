@@ -1,0 +1,24 @@
+# Binarios y artefactos de build
+/api
+/audit-keygen
+/auditctl
+/audit-open
+/bin/
+*.exe
+*.test
+*.out
+
+# Variables de entorno con valores reales
+.env
+
+# Instrucciones locales del agente (no versionadas)
+CLAUDE.md
+.clauderules
+
+# IDE
+.vscode/
+.idea/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
