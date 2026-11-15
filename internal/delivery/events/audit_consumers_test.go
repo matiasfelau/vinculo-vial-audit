@@ -363,12 +363,19 @@ func TestDeliveredInvalidoVaDirectoALaDLQSinTocarS3(t *testing.T) {
 		"bucket es el de Audit":              func(p map[string]any, _ uuid.UUID) { p["bucket"] = "vinculo-vial-audit-dev-x" },
 		"evidence ausente":                   func(p map[string]any, _ uuid.UUID) { delete(p, "evidence") },
 		"evidence vacía":                     func(p map[string]any, _ uuid.UUID) { p["evidence"] = []any{} },
-		"evidence con demasiadas fotos": func(p map[string]any, id uuid.UUID) {
-			var fotos []map[string]any
-			for i := 0; i <= maxEvidenceItems; i++ {
-				fotos = append(fotos, map[string]any{"role": "GENERAL", "index": i, "key": "alerts/" + id.String() + "/redacted/GENERAL-0.jpg", "sha256": strings.Repeat("a", 64)})
-			}
-			p["evidence"] = fotos
+		"evidence con tres fotos": func(p map[string]any, id uuid.UUID) {
+			p["evidence"] = append(p["evidence"].([]map[string]any), map[string]any{"role": "GENERAL", "index": 1, "key": "alerts/" + id.String() + "/redacted/GENERAL-1.jpg", "sha256": strings.Repeat("a", 64)})
+		},
+		"evidence con una sola foto": func(p map[string]any, _ uuid.UUID) {
+			p["evidence"] = p["evidence"].([]map[string]any)[:1]
+		},
+		"role detail (retirado)":  func(p map[string]any, _ uuid.UUID) { evidenceItem(p, 1)["role"] = "detail" },
+		"role DETAIL (retirado)":  func(p map[string]any, _ uuid.UUID) { evidenceItem(p, 1)["role"] = "DETAIL" },
+		"role context (retirado)": func(p map[string]any, _ uuid.UUID) { evidenceItem(p, 1)["role"] = "context" },
+		"role CONTEXT (retirado)": func(p map[string]any, _ uuid.UUID) { evidenceItem(p, 1)["role"] = "CONTEXT" },
+		"dos GENERAL y ninguna PLATE": func(p map[string]any, _ uuid.UUID) {
+			evidenceItem(p, 1)["role"] = "GENERAL"
+			evidenceItem(p, 1)["index"] = 1
 		},
 		"role ausente":   func(p map[string]any, _ uuid.UUID) { evidenceItem(p, 0)["role"] = nil },
 		"role con guion": func(p map[string]any, _ uuid.UUID) { evidenceItem(p, 0)["role"] = "GENE-RAL" },

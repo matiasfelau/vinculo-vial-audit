@@ -13,7 +13,8 @@ requerimiento judicial.
 - Guarda por cada alerta un registro con el DNI del emisor y la patente denunciada
   **cifrados hacia la clave pública de Audit** (los sella Identity y Vehicle; Audit los guarda
   tal como llegan).
-- Al entregarse la alerta, copia las fotos redactadas a su propio bucket con **S3 Object Lock**
+- Al entregarse la alerta, copia las **dos** fotos redactadas (`GENERAL`, el auto, y `PLATE`, la
+  patente) a su propio bucket con **S3 Object Lock**
   hasta `destroy_at` (creación de la alerta + `AUDIT_RETENTION_DAYS`) y escribe un
   `manifest.json` bloqueado.
 - Destruye los registros vencidos (sweeper), salvo los que tienen retención judicial.
@@ -74,7 +75,9 @@ Comportamiento de cada consumidor:
   `ON CONFLICT DO NOTHING` y calcula `destroy_at`. Un `recorded` repetido no cambia nada.
 - **delivered.** Si el registro no existe, es transitorio (`.retry`); si no existe pero la alerta
   tiene tombstone, es una inconsistencia de Alert y va a la DLQ sin reintento. Si ya está `DELIVERED`,
-  hace ack. Valida que `bucket` sea `EVIDENCE_BUCKET` y que cada clave sea
+  hace ack. Valida que `bucket` sea `EVIDENCE_BUCKET`, que `evidence` tenga exactamente dos
+  fotos, una con `role` `GENERAL` y otra con `PLATE` (cualquier otro rol, como los retirados
+  `DETAIL` y `CONTEXT`, o un rol repetido, va a la DLQ sin tocar S3), y que cada clave sea
   `alerts/{alert_id}/redacted/…`. Por cada foto: la lee, verifica el SHA-256 (si no coincide, DLQ)
   y la sube a `records/{alert_id}/{role}-{index}.jpg` con Object Lock hasta `destroy_at`.
   Después escribe `manifest.json` bloqueado y actualiza la fila en una transacción. Un
@@ -128,7 +131,8 @@ réplicas concurrentes) y crean `audit_records` y `discarded_alerts`. Un trigger
 
 Lo crea Core: privado, SSE-S3, versionado y con Object Lock. Claves:
 
-- `records/{alert_id}/{role}-{index}.jpg`: copia de cada foto redactada.
+- `records/{alert_id}/GENERAL-{index}.jpg` y `records/{alert_id}/PLATE-{index}.jpg`: copia de
+  cada una de las dos fotos redactadas (`{role}-{index}.jpg`).
 - `records/{alert_id}/manifest.json`: `{ alert_id, alert_type, alert_created_at, delivered_at,
   dni_enc_audit, pat_enc_audit, audit_key_id, evidence: [{ role, index, key, sha256 }] }`.
 
