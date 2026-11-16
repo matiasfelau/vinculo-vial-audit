@@ -1,0 +1,102 @@
+name: Publicar Imagen Docker
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag a publicar (ej. v0.1.0)"
+        required: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: audit
+          POSTGRES_PASSWORD: audit
+          POSTGRES_DB: audit
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U audit -d audit"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3.13-alpine
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://audit:audit@localhost:5432/audit?sslmode=disable
+      TEST_RABBITMQ_URL: amqp://guest:guest@localhost:5672/
+    steps:
+      - name: Descargar código fuente
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Configurar Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Descargar dependencias
+        run: go mod download
+
+      - name: Compilar
+        run: |
+          CGO_ENABLED=0 go build -o audit ./cmd/api
+          CGO_ENABLED=0 go build -o auditctl ./cmd/auditctl
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Pruebas unitarias
+        run: go test -race ./... -v
+
+      - name: Pruebas de integración (PostgreSQL y RabbitMQ)
+        run: go test -race -tags integration ./... -v
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar código fuente
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Extraer versión del tag
+        id: version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Iniciar sesión en Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compilar y publicar la imagen
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/vinculo-vial-audit:${{ steps.version.outputs.version }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/vinculo-vial-audit:latest
