@@ -22,3 +22,6 @@ CLAUDE.md
 # Sistema operativo
 .DS_Store
 Thumbs.db
+
+# Contratos de tarea (instrucciones locales, no versionadas)
+CONTRATO-*.md
