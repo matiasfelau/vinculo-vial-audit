@@ -130,3 +130,35 @@ func TestMkdirAllEnUnRepositorioFalla(t *testing.T) {
 		t.Error("no debe crear el directorio dentro del repo")
 	}
 }
+
+// Si el padre es un archivo regular no hay forma de crear el destino: las dos
+// funciones fallan y no dejan nada atrás.
+func TestMkdirAllYCreateFileFallanSiElPadreEsUnArchivo(t *testing.T) {
+	padre := filepath.Join(t.TempDir(), "archivo")
+	if err := os.WriteFile(padre, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	destino := filepath.Join(padre, "hijo")
+
+	if err := MkdirAll(destino); err == nil {
+		t.Error("MkdirAll no falló con un archivo como padre")
+	}
+	file, err := CreateFile(filepath.Join(destino, "clave.key"))
+	if err == nil {
+		_ = file.Close()
+		t.Error("CreateFile no falló con un archivo como padre")
+	}
+	if _, statErr := os.Stat(destino); statErr == nil {
+		t.Error("no debe haberse creado nada bajo un archivo")
+	}
+}
+
+// Una ruta inexistente fuera de un repositorio es válida aunque ningún ancestro
+// inmediato exista todavía.
+func TestAceptaUnaRutaConVariosAncestrosInexistentes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "a", "b", "c", "clave.key")
+
+	if err := EnsureOutsideRepo(path); err != nil {
+		t.Fatalf("error inesperado: %v", err)
+	}
+}
