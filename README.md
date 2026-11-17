@@ -219,8 +219,8 @@ go test -tags smoke -v ./internal/smoke/                       # contra el stack
 ### Cobertura
 
 La meta de la cátedra es **85 % o más sobre el total del repo**, con todas las pruebas (unitarias e
-integración) en un único reporte. Medición del 2026-11-16: **92,3 %** de las líneas del Cobertura
-XML (94,1 % de las sentencias de `go tool cover`).
+integración) en un único reporte. Medición del 2026-11-16: **92,9 %** de las líneas del Cobertura
+XML (94,6 % de las sentencias de `go tool cover`). El CI falla si el total baja de 85 %.
 
 ```bash
 go test -covermode=atomic -coverpkg=./... -coverprofile=unit.out ./...
@@ -235,8 +235,10 @@ GOFLAGS=-tags=integration gocover-cobertura < coverage.out > coverage.xml   # l�
   ese tag y, sin él, `gocover-cobertura` falla con `unable to determine file path`.
 - **Exclusiones: ninguna.** No hay código generado y no se excluye código escrito a mano; los
   helpers de prueba (`testsupport`, `postgrestest`) entran en el cálculo por usar `-coverpkg=./...`.
-- Los `main` de `cmd/` quedan en el borde del proceso (señales y código de salida). La lógica está
-  en `run(ctx, cfg)` (`cmd/api`), en `buildServices` (`cmd/auditctl`) y en los paquetes
+- Los `main` de `cmd/` quedan en el borde del proceso (señales y código de salida). En `cmd/api`,
+  `main` es una línea (`os.Exit(exitCode(execute))`): `execute` prepara el logger, carga la
+  configuración y llama a `run`, y `exitCode` decide el código de salida y loguea el error; las dos
+  se prueban. La lógica está en `run(ctx, cfg)` (`cmd/api`), en `buildServices` (`cmd/auditctl`) y en los paquetes
   `internal/cli/*`, todos con pruebas. Las de `run` y `buildServices` con base real corren con el
   tag `integration`; `run` se levanta contra PostgreSQL y RabbitMQ reales y se apaga cancelando el
   contexto.
@@ -332,7 +334,8 @@ en un comentario). Dependabot actualiza `gomod`, `github-actions` y `docker` cad
    `-race -covermode=atomic -coverpkg=./...`.
 2. Une los dos perfiles (`gocovmerge`) y los convierte a Cobertura XML (`gocover-cobertura`). El
    reporte único sale como artefacto `cobertura`, y la cobertura total (líneas y sentencias) en el
-   resumen del job. **No corta el job:** el gate sobre el total llega cuando el repo esté en 85 %.
+   resumen del job. **Gate sobre el total:** el job falla si las sentencias bajan de 85 %. Desde
+   este gate, ninguna rama puede bajar el total de ese mínimo.
 3. En PR, **diff-cover** exige **85 % o más sobre las líneas nuevas** contra `origin/dev`.
 
 **Job `security`:**

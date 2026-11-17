@@ -81,8 +81,7 @@ jobs:
           GOFLAGS=-tags=integration gocover-cobertura < coverage.out > coverage.xml
 
       - name: Publicar la cobertura total
-        # Informa sin cortar el job: el gate sobre el total llega cuando todos los
-        # repos estén en 85 % o más.
+        # Va al resumen del job; el paso siguiente exige el mínimo.
         run: |
           {
             echo "## Cobertura total"
@@ -94,6 +93,13 @@ jobs:
           PY
             echo "- Sentencias (go tool cover): **$(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}')**"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Segundo gate, sobre el total del repo: ninguna rama puede bajarlo de 85 %.
+      - name: Gate de cobertura total (>= 85 %)
+        run: |
+          total="$(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}')"
+          echo "Cobertura total: ${total}"
+          awk -v t="${total%\%}" 'BEGIN { exit (t >= 85) ? 0 : 1 }'
 
       - name: Subir el reporte de cobertura
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
