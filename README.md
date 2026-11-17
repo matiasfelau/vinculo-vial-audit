@@ -293,6 +293,57 @@ abren con la clave vieja; `audit-open` acepta varias claves a la vez), pero camb
 una operación manual que coordina el responsable legal. Perder la clave privada hace
 irrecuperables los datos.
 
+## CI
+
+`.github/workflows/ci.yml` corre en cada `pull_request` hacia `dev` o `main` (y en los push a esas
+ramas), con `permissions: contents: read` y las acciones de terceros fijadas por SHA (la versión va
+en un comentario). Dependabot actualiza `gomod`, `github-actions` y `docker` cada semana.
+
+**Job `build-and-test`** (con PostgreSQL y RabbitMQ como servicios):
+
+1. Compila los cuatro binarios, `go vet` y las pruebas unitarias y de integración, ambas con
+   `-race -covermode=atomic -coverpkg=./...`.
+2. Une los dos perfiles (`gocovmerge`) y los convierte a Cobertura XML (`gocover-cobertura`). El
+   reporte único sale como artefacto `cobertura`, y la cobertura total (líneas y sentencias) en el
+   resumen del job. **No corta el job:** el gate sobre el total llega cuando el repo esté en 85 %.
+3. En PR, **diff-cover** exige **85 % o más sobre las líneas nuevas** contra `origin/dev`.
+
+**Job `security`:**
+
+- **Trivy** (`fs`, `vuln,secret,misconfig`, `HIGH,CRITICAL`, `--ignore-unfixed`): falla el job.
+  Las excepciones van solo en `.trivyignore`, cada una con el motivo y la fecha de revisión.
+- **govulncheck:** falla ante vulnerabilidades alcanzables.
+- **Semgrep** (`p/default`): informativo; el resultado va al resumen del job y no lo corta.
+
+**Exclusiones de cobertura: ninguna.** No hay código generado y no se excluye código escrito a
+mano. Los helpers de prueba (`testsupport`, `postgrestest`) entran en el cálculo por usar
+`-coverpkg=./...`.
+
+### Correr lo mismo en local
+
+```bash
+# Cobertura (necesita DATABASE_URL y TEST_RABBITMQ_URL, ver "Tests")
+go test -race -covermode=atomic -coverpkg=./... -coverprofile=unit.out ./...
+go test -race -tags integration -covermode=atomic -coverpkg=./... -coverprofile=integration.out ./...
+go install github.com/wadey/gocovmerge@b5bfa59ec0adc420475f97f89b58045c721d761c
+go install github.com/boumenot/gocover-cobertura@v1.5.0
+gocovmerge unit.out integration.out > coverage.out
+GOFLAGS=-tags=integration gocover-cobertura < coverage.out > coverage.xml
+go tool cover -func=coverage.out | tail -1
+
+# Código nuevo (requiere el historial: git fetch origin dev)
+pip install diff-cover==11.0.2
+diff-cover coverage.xml --compare-branch=origin/dev --fail-under=85
+
+# Escaneos
+trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .
+govulncheck ./...
+semgrep scan --config p/default
+```
+
+`GOFLAGS=-tags=integration` es necesario para convertir: `postgrestest/testdb.go` solo existe con
+ese tag y, sin él, `gocover-cobertura` falla con `unable to determine file path`.
+
 ## Seguridad
 
 - Nunca se loguean criptogramas, DNI, patentes, payloads de `audit.*` ni claves de objetos junto
