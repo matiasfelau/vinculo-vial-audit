@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 
 	"github.com/matiasfelau/vinculo-vial-audit/pkg/config"
 )
@@ -102,6 +105,80 @@ func TestWaitBackgroundSeRindeAlVencerElPlazoYLoAvisa(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "no terminó a tiempo") {
 		t.Errorf("no se avisó que el trabajo de fondo no terminó: %q", logs.String())
+	}
+}
+
+// entornoDelServicio deja definidas las variables que config.Load exige y no
+// tienen valor por defecto, con la base de datos en databaseURL.
+func entornoDelServicio(t *testing.T, databaseURL string) {
+	t.Helper()
+
+	// execute cambia el logger y el modo de gin del proceso: se restauran para
+	// no condicionar a las demás pruebas.
+	logger, modo := slog.Default(), gin.Mode()
+	t.Cleanup(func() {
+		slog.SetDefault(logger)
+		gin.SetMode(modo)
+	})
+
+	for nombre, valor := range map[string]string{
+		"DATABASE_URL":           databaseURL,
+		"RABBITMQ_URL":           "amqp://guest:guest@127.0.0.1:1/",
+		"AUDIT_BUCKET":           "bucket-de-auditoria-de-prueba",
+		"EVIDENCE_BUCKET":        "bucket-de-evidencia-de-prueba",
+		"S3_REGION":              "us-east-1",
+		"AUDIT_RETENTION_DAYS":   "1095",
+		"AUDIT_OBJECT_LOCK_MODE": "GOVERNANCE",
+		"AUDIT_TOMBSTONE_DAYS":   "7",
+	} {
+		t.Setenv(nombre, valor)
+	}
+}
+
+func TestExitCodeEsCeroSiElServicioSeApagaEnOrden(t *testing.T) {
+	if codigo := exitCode(func() error { return nil }); codigo != 0 {
+		t.Errorf("código de salida = %d, se esperaba 0", codigo)
+	}
+}
+
+func TestExitCodeEsUnoYLoguaElErrorSiElServicioFalla(t *testing.T) {
+	var logs bytes.Buffer
+	anterior := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(anterior) })
+
+	codigo := exitCode(func() error { return errors.New("falló el arranque de prueba") })
+
+	if codigo != 1 {
+		t.Errorf("código de salida = %d, se esperaba 1", codigo)
+	}
+	if !strings.Contains(logs.String(), "el servicio terminó con error") || !strings.Contains(logs.String(), "falló el arranque de prueba") {
+		t.Errorf("no se logueó el error de arranque: %q", logs.String())
+	}
+}
+
+func TestExecuteFallaSinConfiguracionYNoArrancaNada(t *testing.T) {
+	entornoDelServicio(t, "")
+
+	err := execute()
+
+	if err == nil || !strings.Contains(err.Error(), "DATABASE_URL") {
+		t.Fatalf("se esperaba el error de la variable obligatoria DATABASE_URL, llegó %v", err)
+	}
+}
+
+func TestExecuteConConfiguracionValidaDevuelveElErrorDeArranque(t *testing.T) {
+	const password = "clave-que-no-debe-aparecer"
+	// El puerto 1 no tiene a nadie escuchando: la conexión se rechaza al instante.
+	entornoDelServicio(t, "postgres://audit:"+password+"@127.0.0.1:1/audit?sslmode=disable&connect_timeout=1")
+
+	err := execute()
+
+	if err == nil {
+		t.Fatal("execute devolvió nil con la base inalcanzable")
+	}
+	if strings.Contains(err.Error(), password) {
+		t.Errorf("el error de arranque filtra la contraseña de la base: %v", err)
 	}
 }
 

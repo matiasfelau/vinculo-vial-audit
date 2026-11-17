@@ -47,20 +47,33 @@ const (
 	startupTimeout = 15 * time.Second
 )
 
-func main() {
+func main() { os.Exit(exitCode(execute)) }
+
+// exitCode corre start y devuelve el código de salida del proceso: 0 si el
+// servicio se apagó en orden y 1 si el arranque o la ejecución fallaron, con el
+// error en el log. Recibe la función para poder probar los dos caminos.
+func exitCode(start func() error) int {
+	if err := start(); err != nil {
+		slog.Error("el servicio terminó con error", "error", err.Error())
+		return 1
+	}
+	return 0
+}
+
+// execute prepara el logger y el modo de gin, carga la configuración y corre el
+// servicio. main queda en llamarla y salir con el estado que corresponda; el
+// arranque en sí vive en run, que recibe la configuración y el contexto.
+func execute() error {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
 	// Sin modo de depuración: ni trazas de rutas ni detalles internos en la salida.
 	gin.SetMode(gin.ReleaseMode)
 
 	cfg, err := config.Load()
-	if err == nil {
-		err = run(context.Background(), cfg)
-	}
 	if err != nil {
-		slog.Error("el servicio terminó con error", "error", err.Error())
-		os.Exit(1)
+		return err
 	}
+	return run(context.Background(), cfg)
 }
 
 // run levanta el servicio con cfg y bloquea hasta que ctx se cancele o llegue
