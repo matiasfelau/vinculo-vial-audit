@@ -21,8 +21,9 @@ import (
 const eventTypeDelivered = "audit.alert.delivered"
 
 const (
-	// maxEvidenceItems acota cuántas fotos admite un evento delivered.
-	maxEvidenceItems = 32
+	// evidenceItemCount es la cantidad exacta de fotos de un evento delivered: una
+	// GENERAL (el auto) y una PLATE (la patente).
+	evidenceItemCount = 2
 	// maxEvidenceIndex acota el índice de una foto dentro de su rol.
 	maxEvidenceIndex = 999
 	// sha256HexLength es el largo de un SHA-256 en hexadecimal.
@@ -129,19 +130,19 @@ func (p *DeliveredProcessor) parseDelivered(envelope InboundEnvelope) (record.De
 	return record.DeliveredInput{AlertID: alertID, DeliveredAt: deliveredAt, Evidence: evidence}, nil
 }
 
-// parseEvidence valida la lista de fotos redactadas: cantidad acotada, rol e
-// índice válidos, clave dentro de alerts/{alert_id}/redacted/, SHA-256 bien
-// formado y sin repetidos.
+// parseEvidence valida la lista de fotos redactadas: exactamente dos, una por
+// rol (GENERAL y PLATE), con índice válido, clave dentro de
+// alerts/{alert_id}/redacted/, SHA-256 bien formado y sin repetidos.
 func parseEvidence(alertID uuid.UUID, items []evidencePayload) ([]manifest.EvidenceItem, error) {
 	if len(items) == 0 {
 		return nil, invalid("evidence ausente o vacía")
 	}
-	if len(items) > maxEvidenceItems {
-		return nil, invalid("evidence excede la cantidad máxima de fotos")
+	if len(items) != evidenceItemCount {
+		return nil, invalid("evidence debe tener exactamente dos fotos (GENERAL y PLATE)")
 	}
 
 	keyPrefix := redactedKeyPrefix + alertID.String() + redactedKeyMiddle
-	seenPhotos := make(map[string]struct{}, len(items))
+	seenRoles := make(map[string]struct{}, len(items))
 	seenKeys := make(map[string]struct{}, len(items))
 	result := make([]manifest.EvidenceItem, 0, len(items))
 
@@ -160,14 +161,13 @@ func parseEvidence(alertID uuid.UUID, items []evidencePayload) ([]manifest.Evide
 			return nil, err
 		}
 
-		photo := manifest.PhotoFileName(*item.Role, *item.Index)
-		if _, dup := seenPhotos[photo]; dup {
-			return nil, invalid("foto de evidencia repetida")
+		if _, dup := seenRoles[*item.Role]; dup {
+			return nil, invalid("foto de evidencia repetida: cada rol va una sola vez")
 		}
 		if _, dup := seenKeys[*item.Key]; dup {
 			return nil, invalid("key de evidencia repetida")
 		}
-		seenPhotos[photo] = struct{}{}
+		seenRoles[*item.Role] = struct{}{}
 		seenKeys[*item.Key] = struct{}{}
 
 		result = append(result, manifest.EvidenceItem{Role: *item.Role, Index: *item.Index, Key: *item.Key, SHA256: sum})

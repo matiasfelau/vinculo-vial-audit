@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"strconv"
 	"time"
 )
@@ -28,14 +27,19 @@ const (
 	ContentTypePhoto    = "image/jpeg"
 )
 
-// rolePattern restringe el rol de una foto: forma parte de la clave de la copia
-// ({role}-{index}.jpg) y del nombre del archivo exportado, así que no admite "-",
-// "/" ni "..".
-var rolePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{0,31}$`)
+const (
+	// RoleGeneral y RolePlate son los únicos roles de foto: toda alerta entregada
+	// tiene exactamente una foto del auto (GENERAL) y una de la patente (PLATE).
+	RoleGeneral = "GENERAL"
+	RolePlate   = "PLATE"
+)
 
-// ValidRole indica si role es un rol de foto admisible.
+// ValidRole indica si role es un rol de foto admisible: solo GENERAL y PLATE.
+// El rol forma parte de la clave de la copia ({role}-{index}.jpg) y del nombre
+// del archivo exportado, así que cualquier otro valor (incluidos "..", "/" o los
+// roles retirados detail y context) se rechaza.
 func ValidRole(role string) bool {
-	return rolePattern.MatchString(role)
+	return role == RoleGeneral || role == RolePlate
 }
 
 // EvidenceItem describe una foto redactada. En el evento delivered Key es la
