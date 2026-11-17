@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main, dev]
 
+permissions:
+  contents: read
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
@@ -37,10 +40,13 @@ jobs:
       TEST_RABBITMQ_URL: amqp://guest:guest@localhost:5672/
     steps:
       - name: Descargar código fuente
-        uses: actions/checkout@v4
+        # fetch-depth 0: diff-cover necesita el historial para comparar con origin/dev.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Configurar Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26"
 
@@ -57,14 +63,106 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # -coverpkg=./... hace que cada perfil mida todo el repo, no solo el paquete
+      # que corre la prueba: un código cubierto desde otro paquete cuenta.
       - name: Pruebas unitarias
-        run: go test -race ./... -v
+        run: go test -race -covermode=atomic -coverpkg=./... -coverprofile=unit.out ./... -v
 
       - name: Pruebas de integración (PostgreSQL y RabbitMQ)
-        run: go test -race -tags integration ./... -v
+        run: go test -race -tags integration -covermode=atomic -coverpkg=./... -coverprofile=integration.out ./... -v
 
-      - name: Escaneo de vulnerabilidades de dependencias
-        # Reporta; no actualiza dependencias (eso solo ocurre por pedido explícito).
+      - name: Unir los perfiles y convertir a Cobertura XML
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install github.com/wadey/gocovmerge@b5bfa59ec0adc420475f97f89b58045c721d761c
+          go install github.com/boumenot/gocover-cobertura@v1.5.0
+          gocovmerge unit.out integration.out > coverage.out
+          # El tag es necesario: postgrestest/testdb.go solo existe con "integration" y,
+          # sin él, gocover-cobertura falla con "unable to determine file path".
+          GOFLAGS=-tags=integration gocover-cobertura < coverage.out > coverage.xml
+
+      - name: Publicar la cobertura total
+        # Informa sin cortar el job: el gate sobre el total llega cuando todos los
+        # repos estén en 85 % o más.
+        run: |
+          {
+            echo "## Cobertura total"
+            echo
+            python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          r = ET.parse("coverage.xml").getroot()
+          print(f"- Líneas (Cobertura XML): **{float(r.get('line-rate')) * 100:.2f} %** ({r.get('lines-covered')} de {r.get('lines-valid')})")
+          PY
+            echo "- Sentencias (go tool cover): **$(go tool cover -func=coverage.out | tail -1 | awk '{print $NF}')**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir el reporte de cobertura
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cobertura
+          path: |
+            coverage.xml
+            coverage.out
+
+      # Solo en PR: en un push no hay rama contra la que comparar.
+      - name: Cobertura del código nuevo (diff-cover)
+        if: github.event_name == 'pull_request'
+        run: |
+          pip install diff-cover==11.0.2
+          diff-cover coverage.xml --compare-branch=origin/dev --fail-under=85 --markdown-report diff-cover.md
+
+      - name: Publicar el resultado de diff-cover
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          if [ -f diff-cover.md ]; then
+            { echo "## Cobertura del código nuevo"; echo; cat diff-cover.md; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar código fuente
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configurar Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26"
+
+      # Las excepciones viven solo en .trivyignore, con el motivo y la fecha de revisión.
+      - name: Trivy (vulnerabilidades, secretos y configuración)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          trivyignores: .trivyignore
+
+      # Falla ante vulnerabilidades alcanzables. No actualiza dependencias.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
           govulncheck ./...
+
+      # Informativo por ahora: no corta el job. Pasa a gate en v0.14.
+      - name: Semgrep
+        continue-on-error: true
+        run: |
+          pip install semgrep==1.185.0
+          semgrep scan --config p/default --json --output semgrep.json || true
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, collections
+          results = json.load(open("semgrep.json")).get("results", [])
+          por_severidad = collections.Counter(r["extra"]["severity"] for r in results)
+          print("## Semgrep (informativo)")
+          print()
+          if not results:
+              print("Sin hallazgos.")
+          else:
+              print(f"{len(results)} hallazgos: " + ", ".join(f"{n} {s}" for s, n in sorted(por_severidad.items())))
+              print()
+              for r in results[:20]:
+                  print(f"- `{r['path']}:{r['start']['line']}` {r['check_id']}")
+          PY
