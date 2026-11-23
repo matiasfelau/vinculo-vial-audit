@@ -103,12 +103,12 @@ func TestClavesDeObjeto(t *testing.T) {
 }
 
 func TestValidRole(t *testing.T) {
-	for _, role := range []string{"GENERAL", "PLATE", "detail", "ctx_1"} {
+	for _, role := range []string{RoleGeneral, RolePlate} {
 		if !ValidRole(role) {
 			t.Errorf("%q debía ser válido", role)
 		}
 	}
-	for _, role := range []string{"", "a-b", "../x", "a/b", "1abc", "con espacio", strings.Repeat("a", 33)} {
+	for _, role := range []string{"", "detail", "DETAIL", "context", "CONTEXT", "ctx_1", "general", "plate", "a-b", "../x", "a/b", "con espacio", strings.Repeat("a", 33)} {
 		if ValidRole(role) {
 			t.Errorf("%q debía ser inválido", role)
 		}

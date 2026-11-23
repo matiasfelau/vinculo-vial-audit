@@ -13,7 +13,8 @@ requerimiento judicial.
 - Guarda por cada alerta un registro con el DNI del emisor y la patente denunciada
   **cifrados hacia la clave pública de Audit** (los sella Identity y Vehicle; Audit los guarda
   tal como llegan).
-- Al entregarse la alerta, copia las fotos redactadas a su propio bucket con **S3 Object Lock**
+- Al entregarse la alerta, copia las **dos** fotos redactadas (`GENERAL`, el auto, y `PLATE`, la
+  patente) a su propio bucket con **S3 Object Lock**
   hasta `destroy_at` (creación de la alerta + `AUDIT_RETENTION_DAYS`) y escribe un
   `manifest.json` bloqueado.
 - Destruye los registros vencidos (sweeper), salvo los que tienen retención judicial.
@@ -74,7 +75,9 @@ Comportamiento de cada consumidor:
   `ON CONFLICT DO NOTHING` y calcula `destroy_at`. Un `recorded` repetido no cambia nada.
 - **delivered.** Si el registro no existe, es transitorio (`.retry`); si no existe pero la alerta
   tiene tombstone, es una inconsistencia de Alert y va a la DLQ sin reintento. Si ya está `DELIVERED`,
-  hace ack. Valida que `bucket` sea `EVIDENCE_BUCKET` y que cada clave sea
+  hace ack. Valida que `bucket` sea `EVIDENCE_BUCKET`, que `evidence` tenga exactamente dos
+  fotos, una con `role` `GENERAL` y otra con `PLATE` (cualquier otro rol, como los retirados
+  `DETAIL` y `CONTEXT`, o un rol repetido, va a la DLQ sin tocar S3), y que cada clave sea
   `alerts/{alert_id}/redacted/…`. Por cada foto: la lee, verifica el SHA-256 (si no coincide, DLQ)
   y la sube a `records/{alert_id}/{role}-{index}.jpg` con Object Lock hasta `destroy_at`.
   Después escribe `manifest.json` bloqueado y actualiza la fila en una transacción. Un
@@ -128,7 +131,8 @@ réplicas concurrentes) y crean `audit_records` y `discarded_alerts`. Un trigger
 
 Lo crea Core: privado, SSE-S3, versionado y con Object Lock. Claves:
 
-- `records/{alert_id}/{role}-{index}.jpg`: copia de cada foto redactada.
+- `records/{alert_id}/GENERAL-{index}.jpg` y `records/{alert_id}/PLATE-{index}.jpg`: copia de
+  cada una de las dos fotos redactadas (`{role}-{index}.jpg`).
 - `records/{alert_id}/manifest.json`: `{ alert_id, alert_type, alert_created_at, delivered_at,
   dni_enc_audit, pat_enc_audit, audit_key_id, evidence: [{ role, index, key, sha256 }] }`.
 
@@ -212,6 +216,35 @@ go test -tags smoke -v ./internal/smoke/                       # contra el stack
   bucket de Audit y prueba `discarded` sobre otro registro. Requiere el servicio corriendo con
   `GOVERNANCE`; ver las variables en el encabezado del archivo.
 
+### Cobertura
+
+La meta de la cátedra es **85 % o más sobre el total del repo**, con todas las pruebas (unitarias e
+integración) en un único reporte. Medición del 2026-11-16: **92,9 %** de las líneas del Cobertura
+XML (94,6 % de las sentencias de `go tool cover`). El CI falla si el total baja de 85 %.
+
+```bash
+go test -covermode=atomic -coverpkg=./... -coverprofile=unit.out ./...
+DATABASE_URL=... TEST_RABBITMQ_URL=... \
+  go test -covermode=atomic -coverpkg=./... -tags integration -coverprofile=integration.out ./...
+gocovmerge unit.out integration.out > coverage.out
+go tool cover -func=coverage.out | tail -1                     # sentencias
+GOFLAGS=-tags=integration gocover-cobertura < coverage.out > coverage.xml   # líneas (formato del CI)
+```
+
+- `GOFLAGS=-tags=integration` es necesario para convertir: `postgrestest/testdb.go` solo existe con
+  ese tag y, sin él, `gocover-cobertura` falla con `unable to determine file path`.
+- **Exclusiones: ninguna.** No hay código generado y no se excluye código escrito a mano; los
+  helpers de prueba (`testsupport`, `postgrestest`) entran en el cálculo por usar `-coverpkg=./...`.
+- Los `main` de `cmd/` quedan en el borde del proceso (señales y código de salida). En `cmd/api`,
+  `main` es una línea (`os.Exit(exitCode(execute))`): `execute` prepara el logger, carga la
+  configuración y llama a `run`, y `exitCode` decide el código de salida y loguea el error; las dos
+  se prueban. La lógica está en `run(ctx, cfg)` (`cmd/api`), en `buildServices` (`cmd/auditctl`) y en los paquetes
+  `internal/cli/*`, todos con pruebas. Las de `run` y `buildServices` con base real corren con el
+  tag `integration`; `run` se levanta contra PostgreSQL y RabbitMQ reales y se apaga cancelando el
+  contexto.
+- El symlink de `pathguard` solo se prueba donde el sistema permite crearlos (Linux/CI); en Windows
+  sin privilegios esa prueba se omite y el número local sale algo más bajo.
+
 ## CLIs y procedimiento ante un requerimiento judicial
 
 ### `audit-keygen -out <ruta>`
@@ -288,6 +321,58 @@ No existe rotación automática: el formato la admite con `audit_key_id` (los re
 abren con la clave vieja; `audit-open` acepta varias claves a la vez), pero cambiar de clave es
 una operación manual que coordina el responsable legal. Perder la clave privada hace
 irrecuperables los datos.
+
+## CI
+
+`.github/workflows/ci.yml` corre en cada `pull_request` hacia `dev` o `main` (y en los push a esas
+ramas), con `permissions: contents: read` y las acciones de terceros fijadas por SHA (la versión va
+en un comentario). Dependabot actualiza `gomod`, `github-actions` y `docker` cada semana.
+
+**Job `build-and-test`** (con PostgreSQL y RabbitMQ como servicios):
+
+1. Compila los cuatro binarios, `go vet` y las pruebas unitarias y de integración, ambas con
+   `-race -covermode=atomic -coverpkg=./...`.
+2. Une los dos perfiles (`gocovmerge`) y los convierte a Cobertura XML (`gocover-cobertura`). El
+   reporte único sale como artefacto `cobertura`, y la cobertura total (líneas y sentencias) en el
+   resumen del job. **Gate sobre el total:** el job falla si las sentencias bajan de 85 %. Desde
+   este gate, ninguna rama puede bajar el total de ese mínimo.
+3. En PR, **diff-cover** exige **85 % o más sobre las líneas nuevas** contra `origin/dev`.
+
+**Job `security`:**
+
+- **Trivy** (`fs`, `vuln,secret,misconfig`, `HIGH,CRITICAL`, `--ignore-unfixed`): falla el job.
+  Las excepciones van solo en `.trivyignore`, cada una con el motivo y la fecha de revisión.
+- **govulncheck:** falla ante vulnerabilidades alcanzables.
+- **Semgrep** (`p/default`): informativo; el resultado va al resumen del job y no lo corta.
+
+**Exclusiones de cobertura: ninguna.** No hay código generado y no se excluye código escrito a
+mano. Los helpers de prueba (`testsupport`, `postgrestest`) entran en el cálculo por usar
+`-coverpkg=./...`.
+
+### Correr lo mismo en local
+
+```bash
+# Cobertura (necesita DATABASE_URL y TEST_RABBITMQ_URL, ver "Tests")
+go test -race -covermode=atomic -coverpkg=./... -coverprofile=unit.out ./...
+go test -race -tags integration -covermode=atomic -coverpkg=./... -coverprofile=integration.out ./...
+go install github.com/wadey/gocovmerge@b5bfa59ec0adc420475f97f89b58045c721d761c
+go install github.com/boumenot/gocover-cobertura@v1.5.0
+gocovmerge unit.out integration.out > coverage.out
+GOFLAGS=-tags=integration gocover-cobertura < coverage.out > coverage.xml
+go tool cover -func=coverage.out | tail -1
+
+# Código nuevo (requiere el historial: git fetch origin dev)
+pip install diff-cover==11.0.2
+diff-cover coverage.xml --compare-branch=origin/dev --fail-under=85
+
+# Escaneos
+trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 .
+govulncheck ./...
+semgrep scan --config p/default
+```
+
+`GOFLAGS=-tags=integration` es necesario para convertir: `postgrestest/testdb.go` solo existe con
+ese tag y, sin él, `gocover-cobertura` falla con `unable to determine file path`.
 
 ## Seguridad
 

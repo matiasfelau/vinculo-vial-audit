@@ -47,16 +47,25 @@ const (
 	startupTimeout = 15 * time.Second
 )
 
-func main() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+func main() { os.Exit(exitCode(execute)) }
 
-	if err := run(); err != nil {
+// exitCode corre start y devuelve el código de salida del proceso: 0 si el
+// servicio se apagó en orden y 1 si el arranque o la ejecución fallaron, con el
+// error en el log. Recibe la función para poder probar los dos caminos.
+func exitCode(start func() error) int {
+	if err := start(); err != nil {
 		slog.Error("el servicio terminó con error", "error", err.Error())
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
 
-func run() error {
+// execute prepara el logger y el modo de gin, carga la configuración y corre el
+// servicio. main queda en llamarla y salir con el estado que corresponda; el
+// arranque en sí vive en run, que recibe la configuración y el contexto.
+func execute() error {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
 	// Sin modo de depuración: ni trazas de rutas ni detalles internos en la salida.
 	gin.SetMode(gin.ReleaseMode)
 
@@ -64,7 +73,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	return run(context.Background(), cfg)
+}
 
+// run levanta el servicio con cfg y bloquea hasta que ctx se cancele o llegue
+// SIGINT o SIGTERM. Devuelve nil tras un apagado ordenado.
+func run(ctx context.Context, cfg *config.Config) error {
 	db, err := postgres.Connect(cfg.DatabaseURL)
 	if err != nil {
 		return err
@@ -117,7 +131,7 @@ func run() error {
 	// El apagado ordenado se dispara ante SIGINT o SIGTERM: se dejan de aceptar
 	// solicitudes, los consumidores terminan el mensaje en curso (el resto vuelve a
 	// la cola) y el sweeper termina la vuelta en curso.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	var background sync.WaitGroup
